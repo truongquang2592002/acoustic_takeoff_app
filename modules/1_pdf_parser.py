@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
+import unicodedata
 
 try:
     import fitz  # PyMuPDF
@@ -65,15 +66,21 @@ class PDFPageData:
     unique_fill_colors: List[str] = field(default_factory=list)
     preview_image: Optional[Any] = None  # PIL Image
     sheet_name: str = "Drawing Sheet"
+    dynamic_palette: Dict[str, List[str]] = field(default_factory=dict)
+    cutout_colors: List[str] = field(default_factory=list)
+    legend_bounds: Optional[Tuple[float, float, float, float]] = None
+    legend_entries: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # Standard AEC Acoustic Material Color Palette Mappings
 DEFAULT_MATERIAL_PALETTE: Dict[str, List[str]] = {
     "Polyester 9mm": [
-        "#0078D4", "#0284C7", "#00AAFF", "#0047D4", "#005A9E", "#0077D4", "#38BDF8", "#0369A1"
+        "#0078D4", "#0284C7", "#00AAFF", "#0047D4", "#005A9E", "#0077D4", "#38BDF8", "#0369A1",
+        "#808080", "#7F7F7F", "#828282", "#A0A0A0", "#9E9E9E", "#6B7280", "#4B5563"  # Acoustic Grey PET Felt
     ],
     "Wood Slat Panel": [
-        "#D9822B", "#D97706", "#F59E0B", "#B45309", "#92400E", "#D9821A", "#EA580C", "#CA8A04"
+        "#D9822B", "#D97706", "#F59E0B", "#B45309", "#92400E", "#D9821A", "#EA580C", "#CA8A04",
+        "#8B4513", "#A0522D", "#6F4E37", "#5C4033", "#78350F"  # Natural Timber & Walnut Tones
     ],
     "Fabric Wrapped 25mm": [
         "#059669", "#10B981", "#047857", "#065F46", "#34D399", "#15803D", "#16A34A"
@@ -82,8 +89,40 @@ DEFAULT_MATERIAL_PALETTE: Dict[str, List[str]] = {
 
 # Cutout / Void Deduction Colors (Red, Crimson, Scarlet)
 DEFAULT_CUTOUT_COLORS: List[str] = [
-    "#D92626", "#EF4444", "#DC2626", "#FF0000", "#E11D48", "#B91C1C", "#991B1B", "#F87171"
+    "#D92626", "#EF4444", "#DC2626", "#FF0000", "#E11D48", "#B91C1C", "#991B1B", "#F87171", "#DB2626"
 ]
+
+# AEC Material Recognition Regular Expressions (Bilingual: Vietnamese & English AEC standards)
+LEGEND_HEADER_REGEX = re.compile(
+    r"(?i)\b(LEGEND|SPECIFICATIONS?|FINISH\s*SCHEDULE|MATERIAL\s*SCHEDULE|"
+    r"BANG\s*GHI\s*CHU|GHI\s*CHU|CHU\s*THICH|KY\s*HIEU)\b"
+)
+
+MATERIAL_KEYWORDS_REGEX = re.compile(
+    r"(?i)\b("
+    r"TIEU\s*AM|TAM\s*TIEU\s*AM|VACH\s*TIEU\s*AM|TRAN\s*TIEU\s*AM|"
+    r"BOC\s*VAI|VAI\s*NI|GO\s*TIEU\s*AM|SOI\s*KHOANG|MUT\s*HAP\s*THU|MUT\s*TIEU\s*AM|"
+    r"DUC\s*LO|XE\s*RANH|PET\s*FELT|POLYESTER|"
+    r"ACOUSTIC|WOOD\s*SLAT|FABRIC\s*WRAPPED|SOUND\s*ABSORB|"
+    r"BAFFLE|CEILING\s*CLOUD|WALL\s*PANEL|CEILING\s*PANEL|"
+    r"TP\s*[-_]?\d{3,4}|AP\s*[-_]?\d*|AC\s*[-_]?\d*|TA\s*[-_]?\d*|WP\s*[-_]?\d*|CP\s*[-_]?\d*|"
+    r"BF\s*[-_]?\d*|PN\s*[-_]?\d*"
+    r")\b"
+)
+
+CUTOUT_KEYWORDS_REGEX = re.compile(
+    r"(?i)\b("
+    r"CUTOUT|VOID|OPENING|LO\s*KHOET|LO\s*MO|KHOET\s*LO|"
+    r"DOOR\s*VOID|WINDOW\s*VOID|GLAZING|CUA\s*DI|CUA\s*SO"
+    r")\b"
+)
+
+
+def strip_accents(text: str) -> str:
+    """Strip Vietnamese diacritics and convert text to normalized ASCII for robust keyword matching."""
+    norm = unicodedata.normalize('NFD', text)
+    ascii_text = ''.join(c for c in norm if unicodedata.category(c) != 'Mn')
+    return ascii_text
 
 
 def rgb_to_hex(rgb: Optional[Tuple[float, ...]]) -> Optional[str]:
@@ -118,7 +157,7 @@ def color_distance(hex1: Optional[str], hex2: Optional[str]) -> float:
     r1, g1, b1 = int(h1[0:2], 16), int(h1[2:4], 16), int(h1[4:6], 16)
     r2, g2, b2 = int(h2[0:2], 16), int(h2[2:4], 16), int(h2[4:6], 16)
     dist = math.hypot(r1 - r2, g1 - g2, b1 - b2)
-    return dist / 441.67
+    return dist / 441.67295593
 
 
 def matches_color_list(candidate_hex: Optional[str], target_hexes: List[str], tolerance: float = 0.10) -> bool:
@@ -131,42 +170,250 @@ def matches_color_list(candidate_hex: Optional[str], target_hexes: List[str], to
     return False
 
 
+def clean_legend_label(text: str) -> str:
+    """Clean and standardize material annotation / legend item text."""
+    cleaned = re.sub(r"^(?:TYPE|MÃ|KÝ HIỆU|LOẠI)[:\s\-]+", "", text, flags=re.I).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def extract_page_legend_and_swatches(
+    page: Any,
+    drawings: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Senior QS Legend & Schedule Parser:
+    1. Reads text annotations to locate Legend / Ghi Chú headers and determine the legend bounds.
+    2. Identifies acoustic material descriptions (e.g. TP605, GỖ TIÊU ÂM, BỌC VẢI, AP-1).
+    3. Finds adjacent vector swatches (compact filled rects or stroke indicator lines) on the same horizontal band (dy <= 9 pt).
+    4. Dynamically builds a color-to-material mapping dictionary (including grey, brown, or custom CAD colors).
+    5. Detects cutout deduction styles (e.g. red lines, dashed openings).
+    """
+    rect = page.rect
+    width_pt, height_pt = rect.width, rect.height
+    words = page.get_text("words")
+
+    # 1. Locate Legend Header Block (Accent-insensitive)
+    legend_header_pt = None
+    legend_header_bbox = None
+    blocks = page.get_text("blocks")
+    for b in blocks:
+        raw_t = b[4].strip()
+        norm_t = strip_accents(raw_t).upper()
+        if LEGEND_HEADER_REGEX.search(norm_t) or LEGEND_HEADER_REGEX.search(raw_t.upper()):
+            legend_header_bbox = (b[0], b[1], b[2], b[3])
+            legend_header_pt = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+            break
+
+    legend_bounds: Optional[Tuple[float, float, float, float]] = None
+    if legend_header_pt:
+        enclosing_rects = []
+        for d in drawings:
+            r = d.get("rect")
+            if not r:
+                continue
+            if r.width > width_pt * 0.85 or r.height > height_pt * 0.85:
+                continue
+            if r.x0 <= legend_header_pt[0] <= r.x1 and r.y0 <= legend_header_pt[1] <= r.y1:
+                enclosing_rects.append(r)
+        if enclosing_rects:
+            enclosing_rects.sort(key=lambda r: r.width * r.height)
+            best_r = enclosing_rects[0]
+            legend_bounds = (best_r.x0, best_r.y0, best_r.x1, best_r.y1)
+        elif legend_header_bbox:
+            legend_bounds = (
+                max(0.0, legend_header_bbox[0] - 25.0),
+                max(0.0, legend_header_bbox[1] - 15.0),
+                min(width_pt, legend_header_bbox[0] + 360.0),
+                min(height_pt, legend_header_bbox[3] + 240.0)
+            )
+
+    # If this page does NOT contain a legend table, return empty to prevent elevation text from leaking into swatches
+    if not legend_bounds:
+        return {
+            "legend_bounds": None,
+            "dynamic_palette": {},
+            "cutout_colors": [],
+            "legend_entries": []
+        }
+
+    lx0, ly0, lx1, ly1 = legend_bounds
+
+    # 2. Group words into lines inside legend bounds
+    lines_dict: Dict[Tuple[int, int], List[Any]] = {}
+    for w in words:
+        if lx0 - 15 <= w[0] and w[2] <= lx1 + 15 and ly0 - 15 <= w[1] and w[3] <= ly1 + 15:
+            key = (w[5], w[6])
+            lines_dict.setdefault(key, []).append(w)
+
+    legend_text_lines = []
+    for (b_no, l_no), w_list in lines_dict.items():
+        w_list.sort(key=lambda item: item[7])
+        t = " ".join(item[4] for item in w_list).strip()
+        if not t:
+            continue
+        min_x = min(item[0] for item in w_list)
+        min_y = min(item[1] for item in w_list)
+        max_x = max(item[2] for item in w_list)
+        max_y = max(item[3] for item in w_list)
+
+        t_norm = strip_accents(t).upper()
+        # Skip legend header line
+        if LEGEND_HEADER_REGEX.search(t_norm) and any(w in t_norm for w in ["ACOUSTIC", "SPECIFICATION", "GHI CHU", "CHÚ THÍCH", "LEGEND"]):
+            continue
+
+        legend_text_lines.append({
+            "text": t,
+            "norm_text": t_norm,
+            "bbox": (min_x, min_y, max_x, max_y),
+            "center_y": (min_y + max_y) / 2.0,
+            "center_x": (min_x + max_x) / 2.0
+        })
+
+    # 3. Collect candidate swatches (compact shapes) inside legend bounds
+    swatches = []
+    for d in drawings:
+        r = d.get("rect")
+        if not r:
+            continue
+        if not (lx0 - 8 <= r.x0 and r.x1 <= lx1 + 8 and ly0 - 8 <= r.y0 and r.y1 <= ly1 + 8):
+            continue
+        # Skip legend container border
+        if abs(r.width - (lx1 - lx0)) < 6.0 and abs(r.height - (ly1 - ly0)) < 6.0:
+            continue
+
+        w, h = r.width, r.height
+        if (4.0 <= w <= 140.0 and 0.0 <= h <= 50.0) or (0.0 <= w <= 50.0 and 4.0 <= h <= 140.0):
+            stroke_h = rgb_to_hex(d.get("color"))
+            fill_h = rgb_to_hex(d.get("fill"))
+            if fill_h == "#FFFFFF" and stroke_h in (None, "#000000", "#FFFFFF"):
+                continue
+            swatches.append({
+                "rect": r,
+                "center_y": (r.y0 + r.y1) / 2.0,
+                "stroke_hex": stroke_h,
+                "fill_hex": fill_h,
+                "d_ref": d
+            })
+
+    dynamic_palette: Dict[str, List[str]] = {}
+    cutout_colors: List[str] = []
+    legend_entries: List[Dict[str, Any]] = []
+
+    # 4. Proximity alignment between text and swatches
+    for line in legend_text_lines:
+        txt = line["text"]
+        t_norm = line["norm_text"]
+        is_cutout = bool(CUTOUT_KEYWORDS_REGEX.search(t_norm)) or bool(CUTOUT_KEYWORDS_REGEX.search(txt))
+        is_mat = bool(MATERIAL_KEYWORDS_REGEX.search(t_norm)) or bool(MATERIAL_KEYWORDS_REGEX.search(txt))
+        if not (is_cutout or is_mat):
+            continue
+
+        l_x0, l_y0, l_x1, l_y1 = line["bbox"]
+        l_cy = line["center_y"]
+
+        best_swatch = None
+        best_dist = 9999.0
+        for s in swatches:
+            dy = abs(s["center_y"] - l_cy)
+            if dy > 9.0:
+                continue
+            sr = s["rect"]
+            if sr.x1 <= l_x0 + 15 and (l_x0 - sr.x1) <= 140:
+                dx = max(0.0, l_x0 - sr.x1)
+            elif sr.x0 >= l_x1 - 15 and (sr.x0 - l_x1) <= 140:
+                dx = max(0.0, sr.x0 - l_x1)
+            else:
+                continue
+            score = dx + dy * 3.0
+            if score < best_dist:
+                best_dist = score
+                best_swatch = s
+
+        if best_swatch:
+            s_fill = best_swatch["fill_hex"]
+            s_stroke = best_swatch["stroke_hex"]
+            chosen_hexes = []
+            if s_fill and s_fill != "#FFFFFF":
+                chosen_hexes.append(s_fill)
+            if s_stroke and s_stroke not in chosen_hexes and s_stroke != "#FFFFFF":
+                chosen_hexes.append(s_stroke)
+
+            if is_cutout:
+                for c in chosen_hexes:
+                    if c not in cutout_colors:
+                        cutout_colors.append(c)
+                legend_entries.append({
+                    "type": "cutout",
+                    "label": txt,
+                    "hex_colors": chosen_hexes
+                })
+            elif is_mat:
+                clean_name = clean_legend_label(txt)
+                if chosen_hexes:
+                    dynamic_palette.setdefault(clean_name, [])
+                    for c in chosen_hexes:
+                        if c not in dynamic_palette[clean_name]:
+                            dynamic_palette[clean_name].append(c)
+                    legend_entries.append({
+                        "type": "material",
+                        "label": clean_name,
+                        "hex_colors": chosen_hexes
+                    })
+
+    return {
+        "legend_bounds": legend_bounds,
+        "dynamic_palette": dynamic_palette,
+        "cutout_colors": cutout_colors,
+        "legend_entries": legend_entries
+    }
+
+
 def classify_vector_material(
     stroke_hex: Optional[str],
     fill_hex: Optional[str],
-    palette_map: Optional[Dict[str, List[str]]] = None
+    palette_map: Optional[Dict[str, List[str]]] = None,
+    cutout_colors: Optional[List[str]] = None,
+    tolerance: float = 0.10
 ) -> Tuple[Optional[str], bool]:
     """
-    Classify acoustic material type based on line color, hatching, or fill.
+    Classify acoustic material type based on line color, hatching, or fill using
+    dynamic palette matching, CAD color tolerance (Euclidean distance), and void detection.
     Returns: (material_type or None, is_cutout: bool)
     """
     palette = palette_map if palette_map is not None else DEFAULT_MATERIAL_PALETTE
+    active_cutouts = (cutout_colors or []) + DEFAULT_CUTOUT_COLORS
 
     # 1. Check if it's a cutout / opening deduction
     for hex_val in (stroke_hex, fill_hex):
-        if hex_val and matches_color_list(hex_val, DEFAULT_CUTOUT_COLORS, tolerance=0.10):
+        if hex_val and matches_color_list(hex_val, active_cutouts, tolerance=tolerance):
             return ("Cutout / Opening", True)
 
-    # Filter out pure grays, whites, and dark border/wall lines
-    test_hex = stroke_hex or fill_hex
+    test_hex = fill_hex or stroke_hex
     if not test_hex:
         return (None, False)
 
+    # 2. Check explicitly mapped materials in palette (fill prioritized over stroke)
+    # Allows grey (#808080), brown (#8B4513), or custom project colors if defined in legend/palette
+    if fill_hex:
+        for mat_name, hex_list in palette.items():
+            if matches_color_list(fill_hex, hex_list, tolerance=tolerance):
+                return (mat_name, False)
+
+    if stroke_hex:
+        for mat_name, hex_list in palette.items():
+            if matches_color_list(stroke_hex, hex_list, tolerance=tolerance):
+                return (mat_name, False)
+
+    # 3. Filter out unmapped structural walls, grid lines, and title block borders
     r, g, b = hex_to_rgb(test_hex)
     max_c, min_c = max(r, g, b), min(r, g, b)
     is_grayscale = (max_c - min_c < 0.12) or (max_c < 0.28)
     if is_grayscale:
-        # Ignore structural walls, grid lines, and title block borders
+        # Ignore unmapped structural walls, grid lines, and title block borders
         return (None, False)
 
-    # 2. Check explicitly mapped materials
-    for mat_name, hex_list in palette.items():
-        if stroke_hex and matches_color_list(stroke_hex, hex_list, tolerance=0.10):
-            return (mat_name, False)
-        if fill_hex and matches_color_list(fill_hex, hex_list, tolerance=0.10):
-            return (mat_name, False)
-
-    # 3. Heuristic Hue Fallback (Blue = Polyester 9mm, Orange = Wood Slat, Green = Fabric Wrapped)
+    # 4. Heuristic Hue Fallback for unmapped colored lines
     if b > r + 0.15 and b > g + 0.10:
         return ("Polyester 9mm", False)
     elif r > b + 0.20 and g > b + 0.08 and r >= g:
@@ -175,6 +422,7 @@ def classify_vector_material(
         return ("Fabric Wrapped 25mm", False)
 
     return (None, False)
+
 
 
 def detect_drawing_scales(text_content: str) -> List[Dict[str, Any]]:
@@ -376,6 +624,7 @@ def extract_pdf_data(
 ) -> PDFPageData:
     """
     Parse vector drawings, text annotations, and render a high-res raster preview from a PDF page.
+    Automatically reads Legend / Schedule to construct dynamic material palette and deduce cutouts.
     """
     if fitz is None:
         raise ImportError("PyMuPDF (`fitz`) is required. Please install it with `pip install pymupdf`.")
@@ -410,6 +659,17 @@ def extract_pdf_data(
     stroke_colors_set = set()
     fill_colors_set = set()
 
+    # 1. Senior QS Legend & Swatch Analysis
+    legend_info = extract_page_legend_and_swatches(page, drawings)
+    page_palette = legend_info["dynamic_palette"]
+    page_cutouts = legend_info["cutout_colors"]
+    legend_bounds = legend_info["legend_bounds"]
+
+    # Merge dynamic page palette on top of default palette
+    active_palette: Dict[str, List[str]] = dict(DEFAULT_MATERIAL_PALETTE)
+    for mat_name, hex_list in page_palette.items():
+        active_palette[mat_name] = hex_list
+
     path_id = 1
     for d in drawings:
         stroke = d.get("color")
@@ -417,6 +677,12 @@ def extract_pdf_data(
         width = d.get("width", 1.0)
         layer = d.get("layer")
         d_rect = d.get("rect", (0, 0, 0, 0))
+
+        # Skip swatch icons and border lines inside the Legend container so they aren't taken off as room panels
+        if legend_bounds:
+            lx0, ly0, lx1, ly1 = legend_bounds
+            if lx0 - 2 <= d_rect[0] and d_rect[2] <= lx1 + 2 and ly0 - 2 <= d_rect[1] and d_rect[3] <= ly1 + 2:
+                continue
 
         stroke_h = rgb_to_hex(stroke)
         if stroke_h:
@@ -466,8 +732,12 @@ def extract_pdf_data(
 
             bbox_tuple = (d_rect[0], d_rect[1], d_rect[2], d_rect[3]) if hasattr(d_rect, "__getitem__") else (0, 0, 0, 0)
 
-            # Classify material
-            mat_type, _ = classify_vector_material(stroke_h, fill_h)
+            # Classify material using dynamic palette, CAD tolerance, and cutout styles
+            mat_type, _ = classify_vector_material(
+                stroke_h, fill_h,
+                palette_map=active_palette,
+                cutout_colors=page_cutouts
+            )
 
             extracted_paths.append(
                 VectorPath(
@@ -511,7 +781,11 @@ def extract_pdf_data(
         unique_stroke_colors=sorted(list(stroke_colors_set)),
         unique_fill_colors=sorted(list(fill_colors_set)),
         preview_image=preview_img,
-        sheet_name=sheet_name
+        sheet_name=sheet_name,
+        dynamic_palette=page_palette,
+        cutout_colors=page_cutouts,
+        legend_bounds=legend_bounds,
+        legend_entries=legend_info.get("legend_entries", [])
     )
 
 
@@ -523,13 +797,13 @@ def scan_full_document(
     preview_dpi: int = 100
 ) -> Dict[str, Any]:
     """
-    Multi-Page Batch Scanner:
-    1. Iterates through ALL pages in the PDF.
-    2. Auto-detects Sheet Name or Room Name per page using `page.get_text("words")`.
-    3. Classifies acoustic materials based on line colors, hatching, and fills
-       (e.g., Blue lines = 'Polyester 9mm', Orange lines = 'Wood Slat Panel').
-    4. Detects cutouts / opening deduction vectors.
-    5. Returns a structured nested dictionary grouped by Page_Number and Material_Type.
+    Multi-Page Batch Scanner (Senior QS Workflow):
+    1. Reads Bảng Ghi Chú (Legend) across all pages to extract dynamic material mappings (including grey, brown).
+    2. Maintains a document-wide cumulative palette so Master Legends on Sheet 1 propagate to all elevations.
+    3. Auto-detects Sheet Name or Room Name per page using `page.get_text("words")`.
+    4. Quét toàn bộ mặt đứng: matches vectors against dynamic palette within CAD RGB Euclidean tolerance (<= 0.10).
+    5. Deducts cutouts / opening deduction vectors page-by-page.
+    6. Returns a structured nested dictionary grouped by Page_Number and Material_Type compatible with geometry engine.
     """
     if fitz is None:
         raise ImportError("PyMuPDF (`fitz`) is required. Please install it with `pip install pymupdf`.")
@@ -547,7 +821,14 @@ def scan_full_document(
         raise TypeError(f"Unsupported file source type: {type(pdf_path)}")
 
     total_pages = len(doc)
-    palette = material_color_map if material_color_map is not None else DEFAULT_MATERIAL_PALETTE
+
+    # Document-wide cumulative palette: Master Legend on Sheet 1 applies to the whole package
+    global_palette: Dict[str, List[str]] = dict(DEFAULT_MATERIAL_PALETTE)
+    if material_color_map is not None:
+        for m_name, hexes in material_color_map.items():
+            global_palette[m_name] = hexes
+
+    global_cutouts: List[str] = list(DEFAULT_CUTOUT_COLORS)
 
     pages_result: Dict[int, Dict[str, Any]] = {}
     all_materials_encountered = set()
@@ -566,8 +847,26 @@ def scan_full_document(
         raw_text = page.get_text("text")
         detected_scales = detect_drawing_scales(raw_text)
 
-        # 3. Extract Drawings & Classify Materials
+        # 3. Dynamic Legend Extraction on this page
         drawings = page.get_drawings()
+        legend_info = extract_page_legend_and_swatches(page, drawings)
+        page_palette = legend_info["dynamic_palette"]
+        page_cutouts = legend_info["cutout_colors"]
+        legend_bounds = legend_info["legend_bounds"]
+
+        # Register newly discovered materials from this page's Legend into the global palette
+        for mat_name, hex_list in page_palette.items():
+            if mat_name not in global_palette:
+                global_palette[mat_name] = []
+            for hx in hex_list:
+                if hx not in global_palette[mat_name]:
+                    global_palette[mat_name].append(hx)
+
+        for chx in page_cutouts:
+            if chx not in global_cutouts:
+                global_cutouts.append(chx)
+
+        # 4. Extract Drawings & Classify Materials across full elevation
         page_paths: List[VectorPath] = []
         materials_dict: Dict[str, List[VectorPath]] = {}
         cutout_paths: List[VectorPath] = []
@@ -579,6 +878,12 @@ def scan_full_document(
             width = d.get("width", 1.0)
             layer = d.get("layer")
             d_rect = d.get("rect", (0, 0, 0, 0))
+
+            # Skip vector swatches inside the Legend container
+            if legend_bounds:
+                lx0, ly0, lx1, ly1 = legend_bounds
+                if lx0 - 2 <= d_rect[0] and d_rect[2] <= lx1 + 2 and ly0 - 2 <= d_rect[1] and d_rect[3] <= ly1 + 2:
+                    continue
 
             stroke_h = rgb_to_hex(stroke)
             fill_h = rgb_to_hex(fill)
@@ -623,8 +928,12 @@ def scan_full_document(
 
                 bbox_tuple = (d_rect[0], d_rect[1], d_rect[2], d_rect[3]) if hasattr(d_rect, "__getitem__") else (0, 0, 0, 0)
 
-                # Classify material
-                mat_type, is_cutout = classify_vector_material(stroke_h, fill_h, palette)
+                # Classify material using cumulative dynamic palette and CAD color distance tolerance
+                mat_type, is_cutout = classify_vector_material(
+                    stroke_h, fill_h,
+                    palette_map=global_palette,
+                    cutout_colors=global_cutouts
+                )
 
                 v_path = VectorPath(
                     id=path_counter,
@@ -668,7 +977,10 @@ def scan_full_document(
             "cutout_paths": cutout_paths,
             "all_paths": page_paths,
             "total_material_paths": sum(len(p_list) for p_list in materials_dict.values()),
-            "preview_image": preview_img
+            "preview_image": preview_img,
+            "dynamic_palette": page_palette,
+            "cutout_colors": page_cutouts,
+            "legend_bounds": legend_bounds
         }
 
     doc.close()
@@ -731,18 +1043,24 @@ def generate_sample_contractor_drawing(
         page1.insert_text((scale_bar_x + i * seg_w - 2, scale_bar_y + 16), f"{i}m", fontsize=6, fontname="helv")
     page1.insert_text((scale_bar_x + 3 * seg_w - 2, scale_bar_y + 16), "3m", fontsize=6, fontname="helv")
 
-    # Legend
-    page1.draw_rect(fitz.Rect(30, 480, 310, 565), color=(0.4, 0.4, 0.4), fill=(0.97, 0.97, 0.97), width=0.75)
-    page1.insert_text((40, 495), "LEGEND - ACOUSTIC SPECIFICATIONS", fontsize=8, fontname="helv", color=(0, 0, 0))
+    # Legend - Bilingual AEC Specifications with Grey & Brown acoustic finishes
+    page1.draw_rect(fitz.Rect(30, 460, 315, 568), color=(0.4, 0.4, 0.4), fill=(0.97, 0.97, 0.97), width=0.75)
+    page1.insert_text((40, 475), "BẢNG GHI CHÚ - ACOUSTIC SPECIFICATIONS", fontsize=8, fontname="hebo", color=(0, 0, 0))
     # Item 1: Polyester 9mm (Cyan)
-    page1.draw_rect(fitz.Rect(40, 505, 55, 517), color=(0.0, 0.47, 0.85), fill=(0.85, 0.92, 0.98), width=1.0)
-    page1.insert_text((62, 514), "Type AP-1: Polyester 9mm Acoustic Panel", fontsize=7, fontname="helv")
+    page1.draw_rect(fitz.Rect(40, 485, 55, 497), color=(0.0, 0.47, 0.85), fill=(0.85, 0.92, 0.98), width=1.0)
+    page1.insert_text((62, 494), "Type AP-1: Polyester 9mm Acoustic Panel", fontsize=7, fontname="helv")
     # Item 2: Wood Slat (Amber)
-    page1.draw_rect(fitz.Rect(40, 523, 55, 535), color=(0.85, 0.50, 0.10), fill=(1.0, 0.95, 0.85), width=1.0)
-    page1.insert_text((62, 532), "Type AC-2: Wood Slat Acoustic Ceiling Panel", fontsize=7, fontname="helv")
-    # Item 3: Door / Window Cutouts (Red)
-    page1.draw_line(fitz.Point(40, 545), fitz.Point(55, 545), color=(0.85, 0.15, 0.15), width=1.2, dashes="[3 2]")
-    page1.insert_text((62, 548), "Wall Cutouts / Glazing Openings (Deductions)", fontsize=7, fontname="helv")
+    page1.draw_rect(fitz.Rect(40, 502, 55, 514), color=(0.85, 0.50, 0.10), fill=(1.0, 0.95, 0.85), width=1.0)
+    page1.insert_text((62, 511), "Type AC-2: Wood Slat Acoustic Ceiling Panel", fontsize=7, fontname="helv")
+    # Item 3: TP605: Tấm Tiêu Âm Sợi Polyester Xám Ghi (Grey #808080)
+    page1.draw_rect(fitz.Rect(40, 519, 55, 531), color=(0.35, 0.35, 0.35), fill=(0.502, 0.502, 0.502), width=1.0)
+    page1.insert_text((62, 528), "TIÊU ÂM TP605: Tấm Tiêu Âm Sợi Polyester Xám", fontsize=7, fontname="helv")
+    # Item 4: TP603: Gỗ Tiêu Âm Đục Lỗ Nâu Óc Chó (Brown #8B4513)
+    page1.draw_rect(fitz.Rect(40, 536, 55, 548), color=(0.3, 0.15, 0.05), fill=(0.545, 0.271, 0.075), width=1.0)
+    page1.insert_text((62, 545), "GỖ TIÊU ÂM TP603: Gỗ Đục Lỗ Melamine Nâu", fontsize=7, fontname="helv")
+    # Item 5: Door / Window Cutouts (Red)
+    page1.draw_line(fitz.Point(40, 557), fitz.Point(55, 557), color=(0.85, 0.15, 0.15), width=1.2, dashes="[3 2]")
+    page1.insert_text((62, 560), "Wall Cutouts / Glazing Openings (Deductions)", fontsize=7, fontname="helv")
 
     # Room 1: Executive Boardroom 101
     page1.draw_rect(fitz.Rect(50, 50, 400, 450), color=(0.1, 0.1, 0.1), width=2.5)
@@ -800,6 +1118,20 @@ def generate_sample_contractor_drawing(
             baffle_rect = fitz.Rect(bx, by, bx + 70, by + 50)
             page1.draw_rect(baffle_rect, color=(0.85, 0.50, 0.10), fill=(1.0, 0.95, 0.85), width=1.1)
             page1.insert_text((bx + 8, by + 28), f"WOOD-BF-{r+1}{c+1}", fontsize=6.5, fontname="helv", color=(0.55, 0.25, 0.0))
+
+    # Studio 102 Grey PET Panels (TIÊU ÂM TP605 - CAD shift #828282)
+    for g_idx in range(2):
+        gy_top = 220 + g_idx * 75
+        g_box = fitz.Rect(655, gy_top, 715, gy_top + 60)
+        page1.draw_rect(g_box, color=(0.35, 0.35, 0.35), fill=(0.51, 0.51, 0.51), width=1.1)
+        page1.insert_text((660, gy_top + 35), f"TP605-G{g_idx+1}", fontsize=6.5, fontname="helv", color=(1, 1, 1))
+
+    # Studio 102 Walnut Slat Feature (GỖ TIÊU ÂM TP603 - CAD shift #8A4410)
+    for w_idx in range(2):
+        wy_top = 370 + w_idx * 35
+        w_box = fitz.Rect(540, wy_top, 640, wy_top + 28)
+        page1.draw_rect(w_box, color=(0.3, 0.15, 0.05), fill=(0.54, 0.27, 0.06), width=1.1)
+        page1.insert_text((550, wy_top + 18), f"TP603-W{w_idx+1}", fontsize=6.5, fontname="helv", color=(1, 1, 1))
 
     if include_drafting_errors:
         # Defect 1: Unclosed Geometry

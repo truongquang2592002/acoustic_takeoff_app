@@ -52,3 +52,4 @@ Thumbs.db
 
 # Temporary / Output files
 *.log
+scratch/
