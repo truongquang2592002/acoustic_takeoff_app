@@ -36,6 +36,10 @@ class VectorPath:
     bbox: Tuple[float, float, float, float]  # (x0, y0, x1, y1) in pt
     layer: Optional[str] = None
     classified_material: Optional[str] = None
+    local_scale: Optional[float] = None
+    scale_source: str = "sheet_default"
+    dim_w_mm: Optional[float] = None
+    dim_h_mm: Optional[float] = None
 
     @property
     def stroke_hex(self) -> Optional[str]:
@@ -70,19 +74,19 @@ class PDFPageData:
     cutout_colors: List[str] = field(default_factory=list)
     legend_bounds: Optional[Tuple[float, float, float, float]] = None
     legend_entries: List[Dict[str, Any]] = field(default_factory=list)
+    is_skipped: bool = False
+    skip_reason: str = ""
 
 
 # Standard AEC Acoustic Material Color Palette Mappings
+# STRICT QS RULE: Exclusively for Acoustic Polyester (AP / TP605 / TP603 / TP606).
+# Excludes Wood Slat (gỗ nan), drywalls, and general non-acoustic finishes.
 DEFAULT_MATERIAL_PALETTE: Dict[str, List[str]] = {
-    "Polyester 9mm": [
+    "Polyester 9mm (Acoustic Panel)": [
         "#0078D4", "#0284C7", "#00AAFF", "#0047D4", "#005A9E", "#0077D4", "#38BDF8", "#0369A1",
         "#808080", "#7F7F7F", "#828282", "#A0A0A0", "#9E9E9E", "#6B7280", "#4B5563"  # Acoustic Grey PET Felt
     ],
-    "Wood Slat Panel": [
-        "#D9822B", "#D97706", "#F59E0B", "#B45309", "#92400E", "#D9821A", "#EA580C", "#CA8A04",
-        "#8B4513", "#A0522D", "#6F4E37", "#5C4033", "#78350F"  # Natural Timber & Walnut Tones
-    ],
-    "Fabric Wrapped 25mm": [
+    "Fabric Wrapped 25mm (Polyester Core)": [
         "#059669", "#10B981", "#047857", "#065F46", "#34D399", "#15803D", "#16A34A"
     ]
 }
@@ -123,6 +127,155 @@ def strip_accents(text: str) -> str:
     norm = unicodedata.normalize('NFD', text)
     ascii_text = ''.join(c for c in norm if unicodedata.category(c) != 'Mn')
     return ascii_text
+
+
+def is_takeoff_eligible_page(sheet_name: str, page_text: str = "") -> Tuple[bool, str]:
+    """
+    Smart Page Skipping (Chief QS Rule):
+    Inspects sheet title and page text:
+    - Automatically skips Floor Plans (MẶT BẰNG, FLOOR PLAN, LAYOUT PLAN, MB).
+    - Only accepts Elevation / Detail / Section sheets (MẶT ĐỨNG, ELEVATION, CHI TIẾT, DETAIL, SECTION).
+    """
+    norm_sheet = strip_accents(sheet_name).upper()
+    norm_text = strip_accents(page_text[:2500]).upper() if page_text else ""
+
+    fuzzy_plan_regex = re.compile(r"(?i)\b(M[\.·\?]?T\s*B[\.·\?]?NG|FLOOR\s*PLAN|LAYOUT\s*PLAN|FURNITURE\s*PLAN|MB\s*TUONG|MB\s*BO\s*TRI|MB\s*NOI\s*THAT|REFLECTED\s*CEILING|KEY\s*PLAN)\b")
+    fuzzy_elevation_regex = re.compile(r"(?i)\b(M[\.·\?]?T\s*[\.·\?]*[DÐ][\.·\?]*NG|CHI\s*TI[\.·\?]*T|ELEVATION|ELEV|DETAIL|SECTION|M[\.·\?]?T\s*C[\.·\?]?T|WALL\s*ELEVATION|FITOUT\s*ELEVATION)\b")
+
+    # Rule 1: Explicit Floor / Layout Plan exclusion
+    plan_keywords = [
+        "MAT BANG", "FLOOR PLAN", "LAYOUT PLAN", "FURNITURE PLAN",
+        "MB TUONG", "MB BO TRI", "MB NOI THAT", "MB TRAN",
+        "REFLECTED CEILING PLAN", "KEY PLAN"
+    ]
+    if any(kw in norm_sheet for kw in plan_keywords) or fuzzy_plan_regex.search(norm_sheet):
+        return False, "Bản vẽ Mặt Bằng (Floor/Layout Plan) - Bỏ qua, không bóc diện tích vách"
+
+    # Rule 2: Explicit Elevation / Detail inclusion
+    elevation_keywords = [
+        "MAT DUNG", "ELEVATION", "CHI TIET", "DETAIL", "SECTION",
+        "MAT CAT", "WALL ELEVATION", "FITOUT ELEVATION"
+    ]
+    if any(kw in norm_sheet for kw in elevation_keywords) or fuzzy_elevation_regex.search(norm_sheet):
+        return True, "Bản vẽ Mặt Đứng / Chi Tiết (Elevation/Detail)"
+
+    # Rule 3: Check page body text if sheet title was generic
+    if any(kw in norm_text for kw in plan_keywords) or fuzzy_plan_regex.search(norm_text):
+        if not (any(ek in norm_text for ek in elevation_keywords) or fuzzy_elevation_regex.search(norm_text)):
+            return False, "Nội dung trang chứa từ khóa Mặt Bằng - Bỏ qua"
+
+    if any(kw in norm_text for kw in elevation_keywords) or fuzzy_elevation_regex.search(norm_text):
+        return True, "Nội dung trang chứa từ khóa Mặt Đứng / Chi Tiết"
+
+    if "WALL" in norm_text or "VACH" in norm_text:
+        return True, "Phát hiện chỉ định diện vách tường (Wall Fitout)"
+
+    # Default fallback for unannotated pages
+    return False, "Không phát hiện ký hiệu Mặt Đứng / Chi Tiết - Bỏ qua"
+
+
+def is_ap_polyester_material(material_name: Optional[str]) -> bool:
+    """
+    Strict Material Filter (Chief QS Rule):
+    Exclusively retains Acoustic Polyester Panels (AP, Tiêu Âm TP605, TP603, TP606, Polyester).
+    Rejects Wood Slat (gỗ nan), Timber, Drywall, and non-AP materials.
+    """
+    if not material_name:
+        return False
+    norm = strip_accents(material_name).upper()
+    pattern = r"(?i)(\bAP\b|\bAP[-\s]?\d*|\bTP605\b|\bTP603\b|\bTP606\b|POLYESTER|TIEU\s*AM)"
+    return bool(re.search(pattern, norm))
+
+
+def extract_numeric_dimensions(page: Any) -> List[Dict[str, Any]]:
+    """
+    Extract CAD dimension text callouts (e.g. '2400', '1,200', '600') with coordinate bounding boxes.
+    Filters out drawing years, sheet numbers, or structural grid designations.
+    """
+    dims: List[Dict[str, Any]] = []
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:
+        return dims
+
+    for b in blocks:
+        if len(b) < 5 or not b[4].strip():
+            continue
+        txt = b[4].strip()
+        matches = re.finditer(r"\b(\d{1,2}[,\.]\d{3}|\d{3,4})(?:\s*mm)?\b", txt, re.IGNORECASE)
+        for m in matches:
+            val_str = m.group(1).replace(",", "").replace(".", "")
+            try:
+                val_mm = float(val_str)
+                # Filter out years, sheet numbers, stc ratings
+                if 250.0 <= val_mm <= 15000.0 and val_mm not in (2024.0, 2025.0, 2026.0, 2027.0):
+                    dims.append({
+                        "val_mm": val_mm,
+                        "raw_text": txt,
+                        "bbox": (b[0], b[1], b[2], b[3]),
+                        "cx": (b[0] + b[2]) / 2.0,
+                        "cy": (b[1] + b[3]) / 2.0
+                    })
+            except ValueError:
+                continue
+    return dims
+
+
+def calibrate_panel_local_scale_directional(
+    panel_bbox: Tuple[float, float, float, float],
+    dim_candidates: List[Dict[str, Any]],
+    default_scale_multiplier: float
+) -> Tuple[float, str, Optional[float], Optional[float]]:
+    """
+    Dimension-Driven Local Calibration (Chief QS Algorithm):
+    Directionally correlates dimension callouts with panel edges:
+    - Horizontal dimension line (spans along X, placed just above/below panel) -> measures Width (pw).
+    - Vertical dimension line (spans along Y, placed just left/right of panel) -> measures Height (ph).
+    - Checks candidate scale against standard AEC scales (1:10, 1:20, 1:25, 1:50, 1:100).
+    Returns: (local_scale_factor, source_label, matched_w_mm, matched_h_mm)
+    """
+    px0, py0, px1, py1 = panel_bbox
+    pw = abs(px1 - px0)
+    ph = abs(py1 - py0)
+
+    if pw < 2.0 or ph < 2.0 or not dim_candidates:
+        return default_scale_multiplier, "sheet_default", None, None
+
+    std_scales = [1.7639, 3.5278, 7.0556, 8.8194, 17.6389, 35.2778]
+
+    calibrated_scales: List[float] = []
+    matched_w_mm: Optional[float] = None
+    matched_h_mm: Optional[float] = None
+
+    for d in dim_candidates:
+        dcx, dcy = d["cx"], d["cy"]
+        val = d["val_mm"]
+
+        # Horizontal Dimension: centered within panel X span, offset vertically just above or below
+        is_horiz = (px0 - 10.0 <= dcx <= px1 + 10.0) and (abs(dcy - py0) <= 45.0 or abs(dcy - py1) <= 45.0) and not (py0 + 5.0 <= dcy <= py1 - 5.0)
+        if is_horiz:
+            cand_scale = val / pw
+            for std_s in std_scales:
+                if abs(cand_scale - std_s) / std_s <= 0.08:
+                    calibrated_scales.append(cand_scale)
+                    matched_w_mm = val
+                    break
+
+        # Vertical Dimension: centered within panel Y span, offset horizontally just left or right
+        is_vert = (py0 - 10.0 <= dcy <= py1 + 10.0) and (abs(dcx - px0) <= 45.0 or abs(dcx - px1) <= 45.0) and not (px0 + 5.0 <= dcx <= px1 - 5.0)
+        if is_vert:
+            cand_scale = val / ph
+            for std_s in std_scales:
+                if abs(cand_scale - std_s) / std_s <= 0.08:
+                    calibrated_scales.append(cand_scale)
+                    matched_h_mm = val
+                    break
+
+    if calibrated_scales:
+        final_scale = sum(calibrated_scales) / len(calibrated_scales)
+        return final_scale, "dim_calibrated", matched_w_mm, matched_h_mm
+
+    return default_scale_multiplier, "sheet_default", None, None
 
 
 def rgb_to_hex(rgb: Optional[Tuple[float, ...]]) -> Optional[str]:
@@ -349,6 +502,9 @@ def extract_page_legend_and_swatches(
                     "hex_colors": chosen_hexes
                 })
             elif is_mat:
+                # QS Strict Filter: ONLY register material if text satisfies AP/Polyester/Tiêu Âm criteria
+                if not is_ap_polyester_material(txt):
+                    continue
                 clean_name = clean_legend_label(txt)
                 if chosen_hexes:
                     dynamic_palette.setdefault(clean_name, [])
@@ -379,6 +535,7 @@ def classify_vector_material(
     """
     Classify acoustic material type based on line color, hatching, or fill using
     dynamic palette matching, CAD color tolerance (Euclidean distance), and void detection.
+    Strictly restricted to AP Polyester panels (TP605, TP603, TP606, Polyester).
     Returns: (material_type or None, is_cutout: bool)
     """
     palette = palette_map if palette_map is not None else DEFAULT_MATERIAL_PALETTE
@@ -394,16 +551,17 @@ def classify_vector_material(
         return (None, False)
 
     # 2. Check explicitly mapped materials in palette (fill prioritized over stroke)
-    # Allows grey (#808080), brown (#8B4513), or custom project colors if defined in legend/palette
     if fill_hex:
         for mat_name, hex_list in palette.items():
             if matches_color_list(fill_hex, hex_list, tolerance=tolerance):
-                return (mat_name, False)
+                if is_ap_polyester_material(mat_name):
+                    return (mat_name, False)
 
     if stroke_hex:
         for mat_name, hex_list in palette.items():
             if matches_color_list(stroke_hex, hex_list, tolerance=tolerance):
-                return (mat_name, False)
+                if is_ap_polyester_material(mat_name):
+                    return (mat_name, False)
 
     # 3. Filter out unmapped structural walls, grid lines, and title block borders
     r, g, b = hex_to_rgb(test_hex)
@@ -413,13 +571,11 @@ def classify_vector_material(
         # Ignore unmapped structural walls, grid lines, and title block borders
         return (None, False)
 
-    # 4. Heuristic Hue Fallback for unmapped colored lines
+    # 4. Heuristic Hue Fallback for unmapped colored lines (Polyester only)
     if b > r + 0.15 and b > g + 0.10:
-        return ("Polyester 9mm", False)
-    elif r > b + 0.20 and g > b + 0.08 and r >= g:
-        return ("Wood Slat Panel", False)
+        return ("Polyester 9mm (Acoustic Panel)", False)
     elif g > r + 0.15 and g > b + 0.12:
-        return ("Fabric Wrapped 25mm", False)
+        return ("Fabric Wrapped 25mm (Polyester Core)", False)
 
     return (None, False)
 
@@ -659,7 +815,13 @@ def extract_pdf_data(
     stroke_colors_set = set()
     fill_colors_set = set()
 
-    # 1. Senior QS Legend & Swatch Analysis
+    # 1. Page Eligibility & Metadata
+    raw_text = page.get_text("text")
+    sheet_name = extract_sheet_or_room_name(page)
+    is_eligible, skip_reason = is_takeoff_eligible_page(sheet_name, raw_text)
+    dim_candidates = extract_numeric_dimensions(page) if is_eligible else []
+
+    # 2. Senior QS Legend & Swatch Analysis
     legend_info = extract_page_legend_and_swatches(page, drawings)
     page_palette = legend_info["dynamic_palette"]
     page_cutouts = legend_info["cutout_colors"]
@@ -671,91 +833,101 @@ def extract_pdf_data(
         active_palette[mat_name] = hex_list
 
     path_id = 1
-    for d in drawings:
-        stroke = d.get("color")
-        fill = d.get("fill")
-        width = d.get("width", 1.0)
-        layer = d.get("layer")
-        d_rect = d.get("rect", (0, 0, 0, 0))
+    # Only process drawing paths if page is eligible (not a floor plan)
+    if is_eligible:
+        for d in drawings:
+            stroke = d.get("color")
+            fill = d.get("fill")
+            width = d.get("width", 1.0)
+            layer = d.get("layer")
+            d_rect = d.get("rect", (0, 0, 0, 0))
 
-        # Skip swatch icons and border lines inside the Legend container so they aren't taken off as room panels
-        if legend_bounds:
-            lx0, ly0, lx1, ly1 = legend_bounds
-            if lx0 - 2 <= d_rect[0] and d_rect[2] <= lx1 + 2 and ly0 - 2 <= d_rect[1] and d_rect[3] <= ly1 + 2:
-                continue
+            # Skip swatch icons and border lines inside the Legend container so they aren't taken off as room panels
+            if legend_bounds:
+                lx0, ly0, lx1, ly1 = legend_bounds
+                if lx0 - 4 <= d_rect[0] and d_rect[2] <= lx1 + 4 and ly0 - 4 <= d_rect[1] and d_rect[3] <= ly1 + 4:
+                    continue
 
-        stroke_h = rgb_to_hex(stroke)
-        if stroke_h:
-            stroke_colors_set.add(stroke_h)
+            stroke_h = rgb_to_hex(stroke)
+            if stroke_h:
+                stroke_colors_set.add(stroke_h)
 
-        fill_h = rgb_to_hex(fill)
-        if fill_h:
-            fill_colors_set.add(fill_h)
+            fill_h = rgb_to_hex(fill)
+            if fill_h:
+                fill_colors_set.add(fill_h)
 
-        items = d.get("items", [])
-        pts = []
-        is_closed = d.get("closePath", False)
-        cmd_type = "lines"
+            items = d.get("items", [])
+            pts = []
+            is_closed = d.get("closePath", False)
+            cmd_type = "lines"
 
-        for it in items:
-            cmd = it[0]
-            if cmd == "l":
-                p1, p2 = it[1], it[2]
-                if not pts:
-                    pts.append((p1.x, p1.y))
-                pts.append((p2.x, p2.y))
-            elif cmd == "re":
-                r = it[1]
-                pts = [
-                    (r.x0, r.y0),
-                    (r.x1, r.y0),
-                    (r.x1, r.y1),
-                    (r.x0, r.y1),
-                    (r.x0, r.y0)
-                ]
-                is_closed = True
-                cmd_type = "rect"
-            elif cmd == "c":
-                p1, p2, p3, p4 = it[1], it[2], it[3], it[4]
-                if not pts:
-                    pts.append((p1.x, p1.y))
-                for t_step in [0.33, 0.66, 1.0]:
-                    inv = 1.0 - t_step
-                    bx = (inv**3)*p1.x + 3*(inv**2)*t_step*p2.x + 3*inv*(t_step**2)*p3.x + (t_step**3)*p4.x
-                    by = (inv**3)*p1.y + 3*(inv**2)*t_step*p2.y + 3*inv*(t_step**2)*p3.y + (t_step**3)*p4.y
-                    pts.append((bx, by))
-                cmd_type = "curve"
+            for it in items:
+                cmd = it[0]
+                if cmd == "l":
+                    p1, p2 = it[1], it[2]
+                    if not pts:
+                        pts.append((p1.x, p1.y))
+                    pts.append((p2.x, p2.y))
+                elif cmd == "re":
+                    r = it[1]
+                    pts = [
+                        (r.x0, r.y0),
+                        (r.x1, r.y0),
+                        (r.x1, r.y1),
+                        (r.x0, r.y1),
+                        (r.x0, r.y0)
+                    ]
+                    is_closed = True
+                    cmd_type = "rect"
+                elif cmd == "c":
+                    p1, p2, p3, p4 = it[1], it[2], it[3], it[4]
+                    if not pts:
+                        pts.append((p1.x, p1.y))
+                    for t_step in [0.33, 0.66, 1.0]:
+                        inv = 1.0 - t_step
+                        bx = (inv**3)*p1.x + 3*(inv**2)*t_step*p2.x + 3*inv*(t_step**2)*p3.x + (t_step**3)*p4.x
+                        by = (inv**3)*p1.y + 3*(inv**2)*t_step*p2.y + 3*inv*(t_step**2)*p3.y + (t_step**3)*p4.y
+                        pts.append((bx, by))
+                    cmd_type = "curve"
 
-        if pts:
-            if len(pts) >= 3 and math.isclose(pts[0][0], pts[-1][0], abs_tol=1e-3) and math.isclose(pts[0][1], pts[-1][1], abs_tol=1e-3):
-                is_closed = True
+            if pts:
+                if len(pts) >= 3 and math.isclose(pts[0][0], pts[-1][0], abs_tol=1e-3) and math.isclose(pts[0][1], pts[-1][1], abs_tol=1e-3):
+                    is_closed = True
 
-            bbox_tuple = (d_rect[0], d_rect[1], d_rect[2], d_rect[3]) if hasattr(d_rect, "__getitem__") else (0, 0, 0, 0)
+                bbox_tuple = (d_rect[0], d_rect[1], d_rect[2], d_rect[3]) if hasattr(d_rect, "__getitem__") else (0, 0, 0, 0)
 
-            # Classify material using dynamic palette, CAD tolerance, and cutout styles
-            mat_type, _ = classify_vector_material(
-                stroke_h, fill_h,
-                palette_map=active_palette,
-                cutout_colors=page_cutouts
-            )
-
-            extracted_paths.append(
-                VectorPath(
-                    id=path_id,
-                    command_type=cmd_type,
-                    points=pts,
-                    is_closed=is_closed,
-                    stroke_color=stroke[:3] if stroke else None,
-                    fill_color=fill[:3] if fill else None,
-                    stroke_width=width,
-                    bbox=bbox_tuple,
-                    layer=layer,
-                    classified_material=mat_type
+                # Classify material using dynamic palette, CAD tolerance, and cutout styles
+                mat_type, _ = classify_vector_material(
+                    stroke_h, fill_h,
+                    palette_map=active_palette,
+                    cutout_colors=page_cutouts
                 )
-            )
-            path_id += 1
 
-    raw_text = page.get_text("text")
+                # Local Scale Calibration via nearby Dimension Text
+                loc_scale, sc_src, d_w, d_h = calibrate_panel_local_scale_directional(
+                    bbox_tuple, dim_candidates, compute_scale_multiplier("1:50")
+                )
+
+                extracted_paths.append(
+                    VectorPath(
+                        id=path_id,
+                        command_type=cmd_type,
+                        points=pts,
+                        is_closed=is_closed,
+                        stroke_color=stroke[:3] if stroke else None,
+                        fill_color=fill[:3] if fill else None,
+                        stroke_width=width,
+                        bbox=bbox_tuple,
+                        layer=layer,
+                        classified_material=mat_type,
+                        local_scale=loc_scale,
+                        scale_source=sc_src,
+                        dim_w_mm=d_w,
+                        dim_h_mm=d_h
+                    )
+                )
+                path_id += 1
+
     blocks = page.get_text("blocks")
     text_data = []
     for b in blocks:
@@ -766,7 +938,6 @@ def extract_pdf_data(
             })
 
     detected_scales = detect_drawing_scales(raw_text)
-    sheet_name = extract_sheet_or_room_name(page)
 
     doc.close()
 
@@ -785,7 +956,9 @@ def extract_pdf_data(
         dynamic_palette=page_palette,
         cutout_colors=page_cutouts,
         legend_bounds=legend_bounds,
-        legend_entries=legend_info.get("legend_entries", [])
+        legend_entries=legend_info.get("legend_entries", []),
+        is_skipped=not is_eligible,
+        skip_reason=skip_reason
     )
 
 
@@ -840,12 +1013,44 @@ def scan_full_document(
         width_pt, height_pt = rect.width, rect.height
         page_num = page_idx + 1
 
-        # 1. Auto-detect Sheet Name or Room Name via words
+        # 1. Sheet Name & Page Eligibility Analysis (Smart Page Skipping)
         sheet_name = extract_sheet_or_room_name(page)
-
-        # 2. Extract Drawing Scale
         raw_text = page.get_text("text")
         detected_scales = detect_drawing_scales(raw_text)
+
+        is_eligible, skip_reason = is_takeoff_eligible_page(sheet_name, raw_text)
+        if not is_eligible:
+            # Gracefully skip floor plan / layout plan
+            preview_img = None
+            if render_previews:
+                try:
+                    pix = page.get_pixmap(dpi=preview_dpi)
+                    preview_img = Image.open(io.BytesIO(pix.tobytes("png")))
+                except Exception:
+                    preview_img = None
+
+            pages_result[page_num] = {
+                "page_number": page_num,
+                "page_index": page_idx,
+                "sheet_name": sheet_name,
+                "detected_scales": detected_scales,
+                "width_pt": width_pt,
+                "height_pt": height_pt,
+                "materials": {},
+                "cutout_paths": [],
+                "all_paths": [],
+                "total_material_paths": 0,
+                "preview_image": preview_img,
+                "dynamic_palette": {},
+                "cutout_colors": [],
+                "legend_bounds": None,
+                "is_skipped": True,
+                "skip_reason": skip_reason
+            }
+            continue
+
+        # 2. Extract Dimensions on this page for Local Calibration
+        dim_candidates = extract_numeric_dimensions(page)
 
         # 3. Dynamic Legend Extraction on this page
         drawings = page.get_drawings()
@@ -882,7 +1087,7 @@ def scan_full_document(
             # Skip vector swatches inside the Legend container
             if legend_bounds:
                 lx0, ly0, lx1, ly1 = legend_bounds
-                if lx0 - 2 <= d_rect[0] and d_rect[2] <= lx1 + 2 and ly0 - 2 <= d_rect[1] and d_rect[3] <= ly1 + 2:
+                if lx0 - 4 <= d_rect[0] and d_rect[2] <= lx1 + 4 and ly0 - 4 <= d_rect[1] and d_rect[3] <= ly1 + 4:
                     continue
 
             stroke_h = rgb_to_hex(stroke)
@@ -935,6 +1140,11 @@ def scan_full_document(
                     cutout_colors=global_cutouts
                 )
 
+                # Local Scale Calibration via nearby Dimension Text
+                loc_scale, sc_src, d_w, d_h = calibrate_panel_local_scale_directional(
+                    bbox_tuple, dim_candidates, scale_factor
+                )
+
                 v_path = VectorPath(
                     id=path_counter,
                     command_type=cmd_type,
@@ -945,7 +1155,11 @@ def scan_full_document(
                     stroke_width=width,
                     bbox=bbox_tuple,
                     layer=layer,
-                    classified_material=mat_type
+                    classified_material=mat_type,
+                    local_scale=loc_scale,
+                    scale_source=sc_src,
+                    dim_w_mm=d_w,
+                    dim_h_mm=d_h
                 )
                 path_counter += 1
                 page_paths.append(v_path)
@@ -980,7 +1194,9 @@ def scan_full_document(
             "preview_image": preview_img,
             "dynamic_palette": page_palette,
             "cutout_colors": page_cutouts,
-            "legend_bounds": legend_bounds
+            "legend_bounds": legend_bounds,
+            "is_skipped": False,
+            "skip_reason": ""
         }
 
     doc.close()

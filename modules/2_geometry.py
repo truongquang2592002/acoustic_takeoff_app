@@ -31,6 +31,8 @@ _mod_pdf = importlib.import_module("modules.1_pdf_parser")
 VectorPath = _mod_pdf.VectorPath
 color_distance = _mod_pdf.color_distance
 classify_vector_material = _mod_pdf.classify_vector_material
+is_ap_polyester_material = _mod_pdf.is_ap_polyester_material
+is_takeoff_eligible_page = _mod_pdf.is_takeoff_eligible_page
 
 
 @dataclass
@@ -46,7 +48,7 @@ class PanelItem:
     perimeter: float                    # In real-world linear units (e.g. mm, m, or ft)
     cut_width: float                    # Minimum bounding width for fabrication / nesting
     cut_length: float                   # Minimum bounding length for fabrication / nesting
-    material_type: str = "Polyester 9mm"  # Material specification (Polyester 9mm, Wood Slat, etc.)
+    material_type: str = "Polyester 9mm (Acoustic Panel)"  # Strictly AP Polyester
     page_number: int = 1                # Originating PDF page number (1-indexed)
     sheet_name: str = "Drawing Sheet"   # Auto-detected sheet or room name
     layer: Optional[str] = None
@@ -57,6 +59,10 @@ class PanelItem:
     center_x: float = 0.0
     center_y: float = 0.0
     raw_pdf_bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    local_scale: float = 17.6389
+    scale_source: str = "sheet_default"
+    calibrated_dim_w: Optional[float] = None
+    calibrated_dim_h: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -228,22 +234,30 @@ def _process_page_geometry(
     page_items: List[PanelItem] = []
     current_counter = start_counter
 
-    # 2. Iterate through each material type on this page
-    for material_type, paths in materials_dict.items():
-        candidates: List[Tuple[VectorPath, Polygon]] = []
+    # 2. STRICT QS RULE: Filter out non-AP materials (only keep Polyester, TP605, TP603, TP606, AP)
+    filtered_materials: Dict[str, List[VectorPath]] = {}
+    for mat_name, paths in materials_dict.items():
+        if is_ap_polyester_material(mat_name):
+            filtered_materials[mat_name] = paths
+
+    # 3. Iterate through each eligible AP material type on this page
+    for material_type, paths in filtered_materials.items():
+        candidates: List[Tuple[VectorPath, Polygon, float]] = []
 
         for path in paths:
             if panel_colors:
                 if not (matches_any_color(path.stroke_hex, panel_colors) or matches_any_color(path.fill_hex, panel_colors)):
                     continue
 
-            poly = vector_path_to_polygon(path, scale_factor)
+            # Apply local calibrated scale if available from dimensions, otherwise sheet scale factor
+            eff_scale = path.local_scale if (path.local_scale and path.local_scale > 0) else scale_factor
+            poly = vector_path_to_polygon(path, eff_scale)
             if poly is None or poly.is_empty:
                 continue
 
             poly_area_m2 = poly.area * to_m2
             if min_area_m2 <= poly_area_m2 <= max_area_m2:
-                candidates.append((path, poly))
+                candidates.append((path, poly, eff_scale))
 
         # Line-reconstruction fallback
         if len(candidates) == 0:
@@ -262,24 +276,26 @@ def _process_page_geometry(
                             fill_color=None,
                             stroke_width=1.0,
                             bbox=(0, 0, 0, 0),
-                            classified_material=material_type
+                            classified_material=material_type,
+                            local_scale=scale_factor,
+                            scale_source="sheet_default"
                         )
-                        candidates.append((dummy_p, poly))
+                        candidates.append((dummy_p, poly, scale_factor))
 
         # Deduplicate overlapping entities
-        unique_candidates: List[Tuple[VectorPath, Polygon]] = []
-        for path, poly in candidates:
+        unique_candidates: List[Tuple[VectorPath, Polygon, float]] = []
+        for path, poly, eff_scale in candidates:
             dup = False
-            for _, ex_poly in unique_candidates:
+            for _, ex_poly, _ in unique_candidates:
                 if poly.equals_exact(ex_poly, tolerance=1.0) or \
                    (poly.intersection(ex_poly).area / max(poly.area, ex_poly.area) > 0.98):
                     dup = True
                     break
             if not dup:
-                unique_candidates.append((path, poly))
+                unique_candidates.append((path, poly, eff_scale))
 
         # Deduct cutouts and build PanelItems
-        for path, poly in unique_candidates:
+        for path, poly, eff_scale in unique_candidates:
             gross_area_m2 = poly.area * to_m2
             net_poly = poly
             cut_area_m2 = 0.0
@@ -334,7 +350,11 @@ def _process_page_geometry(
                 cutout_count=n_cuts,
                 center_x=centroid.x,
                 center_y=centroid.y,
-                raw_pdf_bbox=path.bbox
+                raw_pdf_bbox=path.bbox,
+                local_scale=eff_scale,
+                scale_source=path.scale_source,
+                calibrated_dim_w=path.dim_w_mm,
+                calibrated_dim_h=path.dim_h_mm
             )
             page_items.append(item)
             current_counter += 1
@@ -387,7 +407,18 @@ def process_geometry_takeoff(
 
         for page_num in sorted(pages_dict.keys()):
             p_info = pages_dict[page_num]
+            # Smart Page Skipping: Ignore Floor Plans / Layout Plans
+            if "is_skipped" in p_info:
+                if p_info["is_skipped"]:
+                    continue
+            else:
+                sheet_name = p_info.get("sheet_name", f"Sheet {page_num}")
+                is_eligible, _ = is_takeoff_eligible_page(sheet_name, "")
+                if not is_eligible:
+                    continue
+
             sheet_name = p_info.get("sheet_name", f"Sheet {page_num}")
+
             materials_dict = p_info.get("materials", {})
             cutout_paths = p_info.get("cutout_paths", [])
 
@@ -422,7 +453,7 @@ def process_geometry_takeoff(
     if not flat_paths:
         return [], []
 
-    # Group flat paths by material
+    # Group flat paths by material strictly filtered for AP Polyester
     materials_dict: Dict[str, List[VectorPath]] = {}
     cutout_paths: List[VectorPath] = []
 
@@ -430,9 +461,8 @@ def process_geometry_takeoff(
         mat_type, is_cutout = classify_vector_material(p.stroke_hex, p.fill_hex)
         if is_cutout:
             cutout_paths.append(p)
-        else:
-            effective_mat = mat_type or "Polyester 9mm"
-            materials_dict.setdefault(effective_mat, []).append(p)
+        elif mat_type and is_ap_polyester_material(mat_type):
+            materials_dict.setdefault(mat_type, []).append(p)
 
     page_items, page_cutouts, _ = _process_page_geometry(
         page_num=1,

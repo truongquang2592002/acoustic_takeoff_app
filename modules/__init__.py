@@ -18,6 +18,10 @@ extract_pdf_data = pdf_parser.extract_pdf_data
 generate_sample_contractor_drawing = pdf_parser.generate_sample_contractor_drawing
 detect_drawing_scales = pdf_parser.detect_drawing_scales
 compute_scale_multiplier = pdf_parser.compute_scale_multiplier
+is_takeoff_eligible_page = pdf_parser.is_takeoff_eligible_page
+is_ap_polyester_material = pdf_parser.is_ap_polyester_material
+extract_numeric_dimensions = pdf_parser.extract_numeric_dimensions
+calibrate_panel_local_scale_directional = pdf_parser.calibrate_panel_local_scale_directional
 
 scan_full_document = pdf_parser.scan_full_document
 
