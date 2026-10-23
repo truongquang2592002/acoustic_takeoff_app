@@ -38,6 +38,8 @@ venv.bak/
 # Environment variables
 .env
 .env.*
+*.env
+QS.env
 !.env.example
 
 # IDE / Editor files
