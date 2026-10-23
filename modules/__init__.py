@@ -44,6 +44,7 @@ run_nesting_optimization = nesting.run_nesting_optimization
 render_nested_sheet_diagram = nesting.render_nested_sheet_diagram
 
 export_takeoff_to_excel = exporter.export_takeoff_to_excel
+add_api_cost_report_sheet = exporter.add_api_cost_report_sheet
 
 QCIssue = qc_validator.QCIssue
 QCReport = qc_validator.QCReport
@@ -60,6 +61,7 @@ render_pdf_page_to_highres_image = ai_vision_qs.render_pdf_page_to_highres_image
 extract_cad_ocr_tokens = ai_vision_qs.extract_cad_ocr_tokens
 process_document_with_ai_vision_qs = ai_vision_qs.process_document_with_ai_vision_qs
 convert_ai_vision_takeoff_to_panel_items = ai_vision_qs.convert_ai_vision_takeoff_to_panel_items
+is_valid_elevation_page = ai_vision_qs.is_valid_elevation_page
 
 # Native CAD 1:1 Parser
 parse_cad_dxf = cad_parser.parse_cad_dxf
@@ -71,6 +73,7 @@ execute_vipro_vision_pipeline = vision_engine.execute_vipro_vision_pipeline
 render_vision_contour_overlay = vision_engine.render_vision_contour_overlay
 detect_wall_and_cutouts_yolo = vision_engine.detect_wall_and_cutouts_yolo
 predict_sam2_mask_replicate = vision_engine.predict_sam2_mask_replicate
+get_last_sam2_gpu_seconds = vision_engine.get_last_sam2_gpu_seconds
 VisionSegmentedPanel = vision_engine.VisionSegmentedPanel
 
 # CrewAI QS Team
@@ -119,6 +122,7 @@ __all__ = [
     "extract_cad_ocr_tokens",
     "process_document_with_ai_vision_qs",
     "convert_ai_vision_takeoff_to_panel_items",
+    "is_valid_elevation_page",
 ]
 
 

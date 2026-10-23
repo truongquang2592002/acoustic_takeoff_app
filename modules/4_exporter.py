@@ -10,6 +10,7 @@ using openpyxl, featuring:
 
 from datetime import datetime
 import io
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -31,6 +32,336 @@ GlobalNestingResult = _mod_nest.GlobalNestingResult
 NestedSheet = _mod_nest.NestedSheet
 
 
+def add_api_cost_report_sheet(
+    wb: Any,
+    api_usage_logs: Optional[List[Dict[str, Any]]] = None,
+    project_name: str = "Acoustic Takeoff Master Project"
+) -> Any:
+    """
+    Generate an AEC-standard 'API Cost Report' sheet within the Master BOQ Excel Workbook.
+    
+    Features:
+    - Tracks AI resource consumption:
+        * Gemini 1.5 Flash (or Pro/Vision) Token usage ($0.075 / 1M tokens)
+        * Replicate SAM 2 GPU execution seconds ($0.000725 / sec)
+    - Executive KPI Cards: Total API Cost, Total Gemini Tokens, SAM 2 GPU Time, Total Requests.
+    - Standard tabular breakdown: Thời gian, Loại API, Lượng sử dụng, Đơn vị tính, Đơn giá tham khảo, Thành tiền (USD), Diễn giải tác vụ.
+    - Dynamic formula total row: =SUM(G...:G...) formatted as Currency ($).
+    - Exception handling: If api_usage_logs is empty (e.g. Native Vector Engine mode),
+      displays prominent message 'Không phát sinh chi phí AI (Sử dụng Vector Engine)' with $0.00 cost.
+    """
+    if openpyxl is None:
+        return None
+
+    is_bytes_input = isinstance(wb, (bytes, bytearray))
+    if is_bytes_input:
+        wb_obj = openpyxl.load_workbook(io.BytesIO(wb))
+    else:
+        wb_obj = wb
+
+    FONT_FAMILY = "Segoe UI"
+    font_main_title = Font(name=FONT_FAMILY, size=15, bold=True, color="1E293B")
+    font_subtitle = Font(name=FONT_FAMILY, size=8.5, color="64748B", italic=True)
+    font_section_hdr = Font(name=FONT_FAMILY, size=11, bold=True, color="0F172A")
+    font_table_hdr = Font(name=FONT_FAMILY, size=9.5, bold=True, color="FFFFFF")
+    font_bold = Font(name=FONT_FAMILY, size=9.5, bold=True, color="1E293B")
+    font_normal = Font(name=FONT_FAMILY, size=9, color="334155")
+    font_kpi_value = Font(name=FONT_FAMILY, size=15, bold=True, color="0369A1")
+    font_kpi_label = Font(name=FONT_FAMILY, size=8, bold=True, color="64748B")
+    font_notice_title = Font(name=FONT_FAMILY, size=11, bold=True, color="0369A1")
+    font_notice_sub = Font(name=FONT_FAMILY, size=9, color="475569", italic=True)
+
+    fill_navy_header = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    fill_blue_header = PatternFill(start_color="0284C7", end_color="0284C7", fill_type="solid")
+    fill_slate_header = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    fill_zebra = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    fill_total_row = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
+    fill_kpi_card = PatternFill(start_color="F0F9FF", end_color="F0F9FF", fill_type="solid")
+    fill_notice = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
+
+    thin_border = Side(border_style="thin", color="CBD5E1")
+    double_bottom = Side(border_style="double", color="1E293B")
+    cell_border = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
+    total_border = Border(left=thin_border, right=thin_border, top=thin_border, bottom=double_bottom)
+
+    align_center = Alignment(horizontal="center", vertical="center")
+    align_left = Alignment(horizontal="left", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    # Remove existing sheet if replacing
+    if "API Cost Report" in wb_obj.sheetnames:
+        del wb_obj["API Cost Report"]
+
+    ws = wb_obj.create_sheet(title="API Cost Report")
+    ws.views.sheetView[0].showGridLines = True
+
+    # Title Block
+    ws["A2"] = "BÁO CÁO CHI PHÍ DỊCH VỤ API & TÀI NGUYÊN AI (API COST REPORT)"
+    ws["A2"].font = font_main_title
+    ws["A3"] = f"Dự án: {project_name} | Hệ Thống Bóc Tách Khối Lượng Tự Động AEC & Multi-Agent Vision | Ngày tạo: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    ws["A3"].font = font_subtitle
+
+    # Normalize empty or None logs
+    logs = list(api_usage_logs) if api_usage_logs else []
+
+    # CASE 1: No API usage (Native Vector Engine mode)
+    if not logs:
+        # KPI Cards (A5:D6)
+        ws["A5"] = "TỔNG CHI PHÍ PHÁT SINH"
+        ws["A5"].font = font_kpi_label
+        ws["A5"].fill = fill_kpi_card
+        ws["A5"].border = cell_border
+        ws["A6"] = 0.0
+        ws["A6"].number_format = '"$"#,##0.0000'
+        ws["A6"].font = font_kpi_value
+        ws["A6"].fill = fill_kpi_card
+        ws["A6"].border = cell_border
+        ws["A6"].alignment = align_center
+
+        ws["B5"] = "ĐỘNG CƠ BÓC TÁCH"
+        ws["B5"].font = font_kpi_label
+        ws["B5"].fill = fill_kpi_card
+        ws["B5"].border = cell_border
+        ws["B6"] = "Vector Engine (Offline)"
+        ws["B6"].font = font_bold
+        ws["B6"].fill = fill_kpi_card
+        ws["B6"].border = cell_border
+        ws["B6"].alignment = align_center
+
+        ws["C5"] = "SỐ PHIÊN GỌI CLOUD API"
+        ws["C5"].font = font_kpi_label
+        ws["C5"].fill = fill_kpi_card
+        ws["C5"].border = cell_border
+        ws["C6"] = 0
+        ws["C6"].font = font_bold
+        ws["C6"].fill = fill_kpi_card
+        ws["C6"].border = cell_border
+        ws["C6"].alignment = align_center
+
+        ws["D5"] = "TIÊU THỤ TÀI NGUYÊN"
+        ws["D5"].font = font_kpi_label
+        ws["D5"].fill = fill_kpi_card
+        ws["D5"].border = cell_border
+        ws["D6"] = "0 Tokens / 0.0s GPU"
+        ws["D6"].font = font_bold
+        ws["D6"].fill = fill_kpi_card
+        ws["D6"].border = cell_border
+        ws["D6"].alignment = align_center
+
+        # Notice Banner (Requirement 3: "Không phát sinh chi phí AI (Sử dụng Vector Engine)")
+        ws["A8"] = "TRẠNG THÁI TÀI NGUYÊN HỆ THỐNG"
+        ws["A8"].font = font_section_hdr
+
+        ws["A9"] = "Không phát sinh chi phí AI (Sử dụng Vector Engine)"
+        ws["A9"].font = font_notice_title
+        ws["A9"].fill = fill_notice
+
+        ws["A10"] = "Toàn bộ khối lượng bóc tách được xử lý hoàn toàn bằng Động cơ Vector Bản địa (PyMuPDF & Shapely) chạy offline trên máy trạm. Không tiêu tốn Token Gemini LLM hay thời gian tính toán GPU Replicate SAM 2."
+        ws["A10"].font = font_notice_sub
+
+        for col_idx in range(1, 9):
+            ws.cell(row=9, column=col_idx).fill = fill_notice
+            ws.cell(row=9, column=col_idx).border = cell_border
+
+        # Table
+        start_row = 12
+        headers = ["STT", "Thời gian", "Loại API", "Lượng sử dụng (Tokens / Seconds)", "Đơn vị tính", "Đơn giá tham khảo (USD)", "Thành tiền (USD)", "Diễn giải tác vụ"]
+        for c_idx, h in enumerate(headers, start=1):
+            c_cell = ws.cell(row=start_row, column=c_idx, value=h)
+            c_cell.font = font_table_hdr
+            c_cell.fill = fill_navy_header
+            c_cell.alignment = align_center
+            c_cell.border = cell_border
+
+        # Informative Row
+        ws.cell(row=13, column=1, value=1).alignment = align_center
+        ws.cell(row=13, column=2, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S")).alignment = align_center
+        ws.cell(row=13, column=3, value="Native Vector Engine (PyMuPDF & Shapely)").font = font_bold
+        ws.cell(row=13, column=4, value=0).alignment = align_right
+        ws.cell(row=13, column=5, value="Local Ops").alignment = align_center
+        ws.cell(row=13, column=6, value="$0.00 / Local CPU").alignment = align_center
+        c_amt = ws.cell(row=13, column=7, value=0.0)
+        c_amt.number_format = '"$"#,##0.0000'
+        c_amt.alignment = align_right
+        c_amt.font = font_bold
+        ws.cell(row=13, column=8, value="Bóc tách vector 2D nội bộ - Không phát sinh chi phí AI đám mây.").font = font_normal
+
+        for c_idx in range(1, 9):
+            ws.cell(row=13, column=c_idx).border = cell_border
+
+        # Total Row
+        ws.cell(row=14, column=1, value="TỔNG CỘNG CHI PHÍ API (TOTAL COST)").font = font_bold
+        ws.cell(row=14, column=1).alignment = align_left
+        tot_c = ws.cell(row=14, column=7, value=0.0)
+        tot_c.number_format = '"$"#,##0.0000'
+        tot_c.font = font_bold
+        tot_c.alignment = align_right
+        ws.cell(row=14, column=8, value="Tổng chi phí API = $0.00 USD").alignment = align_left
+        ws.cell(row=14, column=8).font = font_subtitle
+
+        for c_idx in range(1, 9):
+            ws.cell(row=14, column=c_idx).border = total_border
+            ws.cell(row=14, column=c_idx).fill = fill_total_row
+
+        return ws
+
+    # CASE 2: Active API usage logs
+    tot_tokens = 0
+    tot_sam2_secs = 0.0
+    tot_cost = 0.0
+
+    processed_logs = []
+    for entry in logs:
+        api_type = str(entry.get("api_type", entry.get("type", "Gemini 1.5 Flash")))
+        unit = str(entry.get("unit", "Tokens"))
+        usage = float(entry.get("usage_amount", entry.get("usage", 0.0)))
+        ts = str(entry.get("timestamp", entry.get("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))))
+        desc = str(entry.get("description", entry.get("notes", "-")))
+
+        api_lower = api_type.lower()
+        if "token" in unit.lower() or "gemini" in api_lower:
+            tot_tokens += int(usage)
+            if "pro" in api_lower:
+                rate_val = 3.50 / 1_000_000
+                rate_label = "$3.50 / 1M tokens"
+            else: # Gemini 1.5 Flash default: $0.075 / 1M tokens
+                rate_val = 0.075 / 1_000_000
+                rate_label = "$0.075 / 1M tokens"
+            calc_cost = usage * rate_val
+        elif "sec" in unit.lower() or "sam" in api_lower or "replicate" in api_lower:
+            tot_sam2_secs += usage
+            # Replicate SAM 2 default: $0.000725 / sec
+            rate_val = 0.000725
+            rate_label = "$0.000725 / giây"
+            calc_cost = usage * rate_val
+        else:
+            rate_val = float(entry.get("unit_rate", 0.0))
+            rate_label = str(entry.get("rate_label", f"${rate_val:.6f}"))
+            calc_cost = usage * rate_val
+
+        cost_usd = float(entry.get("cost_usd", entry.get("cost", calc_cost)))
+        tot_cost += cost_usd
+
+        processed_logs.append({
+            "timestamp": ts,
+            "api_type": api_type,
+            "usage": usage,
+            "unit": unit,
+            "rate_label": rate_label,
+            "cost_usd": cost_usd,
+            "description": desc
+        })
+
+    # KPI Cards (A5:D6)
+    ws["A5"] = "TỔNG CHI PHÍ API (USD)"
+    ws["A5"].font = font_kpi_label
+    ws["A5"].fill = fill_kpi_card
+    ws["A5"].border = cell_border
+    ws["A6"] = round(tot_cost, 4)
+    ws["A6"].number_format = '"$"#,##0.0000'
+    ws["A6"].font = font_kpi_value
+    ws["A6"].fill = fill_kpi_card
+    ws["A6"].border = cell_border
+    ws["A6"].alignment = align_center
+
+    ws["B5"] = "TỔNG TOKENS GEMINI"
+    ws["B5"].font = font_kpi_label
+    ws["B5"].fill = fill_kpi_card
+    ws["B5"].border = cell_border
+    ws["B6"] = f"{tot_tokens:,} Tokens"
+    ws["B6"].font = font_bold
+    ws["B6"].fill = fill_kpi_card
+    ws["B6"].border = cell_border
+    ws["B6"].alignment = align_center
+
+    ws["C5"] = "THỜI GIAN GPU SAM 2"
+    ws["C5"].font = font_kpi_label
+    ws["C5"].fill = fill_kpi_card
+    ws["C5"].border = cell_border
+    ws["C6"] = f"{tot_sam2_secs:.2f} Giây"
+    ws["C6"].font = font_bold
+    ws["C6"].fill = fill_kpi_card
+    ws["C6"].border = cell_border
+    ws["C6"].alignment = align_center
+
+    ws["D5"] = "SỐ PHIÊN GỌI DỊCH VỤ"
+    ws["D5"].font = font_kpi_label
+    ws["D5"].fill = fill_kpi_card
+    ws["D5"].border = cell_border
+    ws["D6"] = f"{len(processed_logs)} Phiên"
+    ws["D6"].font = font_bold
+    ws["D6"].fill = fill_kpi_card
+    ws["D6"].border = cell_border
+    ws["D6"].alignment = align_center
+
+    ws["A8"] = "CHI TIẾT LỊCH SỬ TIÊU THỤ TÀI NGUYÊN ĐÁM MÂY (API CONSUMPTION BREAKDOWN)"
+    ws["A8"].font = font_section_hdr
+
+    # Table Headers
+    start_row = 10
+    headers = ["STT", "Thời gian", "Loại API", "Lượng sử dụng (Tokens / Seconds)", "Đơn vị tính", "Đơn giá tham khảo (USD)", "Thành tiền (USD)", "Diễn giải tác vụ"]
+    for c_idx, h in enumerate(headers, start=1):
+        c_cell = ws.cell(row=start_row, column=c_idx, value=h)
+        c_cell.font = font_table_hdr
+        c_cell.fill = fill_navy_header
+        c_cell.alignment = align_center
+        c_cell.border = cell_border
+
+    # Data Rows
+    cur_row = start_row + 1
+    for idx, item in enumerate(processed_logs, start=1):
+        ws.cell(row=cur_row, column=1, value=idx).alignment = align_center
+        ws.cell(row=cur_row, column=2, value=item["timestamp"]).alignment = align_center
+        ws.cell(row=cur_row, column=3, value=item["api_type"]).font = font_bold
+
+        usage_cell = ws.cell(row=cur_row, column=4, value=item["usage"])
+        if "token" in item["unit"].lower():
+            usage_cell.number_format = '#,##0'
+        else:
+            usage_cell.number_format = '#,##0.00'
+        usage_cell.alignment = align_right
+
+        ws.cell(row=cur_row, column=5, value=item["unit"]).alignment = align_center
+        ws.cell(row=cur_row, column=6, value=item["rate_label"]).alignment = align_center
+
+        cost_cell = ws.cell(row=cur_row, column=7, value=item["cost_usd"])
+        cost_cell.number_format = '"$"#,##0.0000'
+        cost_cell.font = font_bold
+        cost_cell.alignment = align_right
+
+        ws.cell(row=cur_row, column=8, value=item["description"]).font = font_normal
+
+        for c_idx in range(1, 9):
+            c_c = ws.cell(row=cur_row, column=c_idx)
+            c_c.border = cell_border
+            if idx % 2 == 1:
+                c_c.fill = fill_zebra
+        cur_row += 1
+
+    # Total Row
+    ws.cell(row=cur_row, column=1, value="TỔNG CỘNG CHI PHÍ API (TOTAL ESTIMATED COST)").font = font_bold
+    ws.cell(row=cur_row, column=1).alignment = align_left
+
+    tot_cell = ws.cell(row=cur_row, column=7, value=f"=SUM(G{start_row + 1}:G{cur_row - 1})")
+    tot_cell.font = font_bold
+    tot_cell.number_format = '"$"#,##0.0000'
+    tot_cell.alignment = align_right
+
+    ws.cell(row=cur_row, column=8, value="Tổng chi phí điện toán đám mây cho phiên bóc tách.").alignment = align_left
+    ws.cell(row=cur_row, column=8).font = font_subtitle
+
+    for c_idx in range(1, 9):
+        c_cell = ws.cell(row=cur_row, column=c_idx)
+        c_cell.border = total_border
+        c_cell.fill = fill_total_row
+
+    if is_bytes_input:
+        buf = io.BytesIO()
+        wb_obj.save(buf)
+        return buf.getvalue()
+    return ws
+
+
 def export_takeoff_to_excel(
     panels: List[PanelItem],
     nesting: Optional[Union[GlobalNestingResult, NestingResult]] = None,
@@ -42,7 +373,8 @@ def export_takeoff_to_excel(
     cost_per_m2: float = 22.5,
     unit: str = "mm",
     output_path: Optional[Union[str, Path]] = None,
-    material_cost_rates: Optional[Dict[str, float]] = None
+    material_cost_rates: Optional[Dict[str, float]] = None,
+    api_usage_logs: Optional[List[Dict[str, Any]]] = None
 ) -> bytes:
     """
     Generate an AEC-standard Master BOQ Excel Workbook (.xlsx):
@@ -50,6 +382,7 @@ def export_takeoff_to_excel(
     - Sheet 2: Detailed BOQ (Itemized panel schedule with Page No., Drawing/Room Name, Material Type, Panel ID, L x W, Cutouts, Net Area)
     - Sheet 3: Nesting by Material (Nesting BOM, cutting plans & CNC coordinates separated by material)
     - Sheet 4: Quality Control & Drafting Audit Log (optional)
+    - Sheet 5: API Cost Report (Cloud AI Token & GPU usage, cost breakdown)
     """
     if openpyxl is None:
         raise ImportError("openpyxl is required for Excel export. Please install it with `pip install openpyxl`.")
@@ -528,6 +861,20 @@ def export_takeoff_to_excel(
                     c_cell.fill = fill_zebra
             qc_row += 1
 
+    # If api_usage_logs is None, check streamlit session_state
+    if api_usage_logs is None:
+        try:
+            import streamlit as _st
+            if hasattr(_st, "session_state") and "api_usage_logs" in _st.session_state:
+                api_usage_logs = _st.session_state.api_usage_logs
+        except Exception:
+            pass
+
+    # =========================================================================
+    # SHEET 5: API USAGE & CLOUD COMPUTING COST REPORT
+    # =========================================================================
+    add_api_cost_report_sheet(wb, api_usage_logs=api_usage_logs, project_name=project_name)
+
     # Auto-fit Column Widths across all sheets
     for ws in wb.worksheets:
         for col in ws.columns:
@@ -539,8 +886,9 @@ def export_takeoff_to_excel(
                     if "\n" in val_str:
                         val_str = max(val_str.split("\n"), key=len)
                     if not str(cell.value).startswith("="):
-                        max_len = max(max_len, len(val_str))
-            ws.column_dimensions[col_letter].width = max(max_len + 3.5, 12.0)
+                        if len(val_str) <= 60:
+                            max_len = max(max_len, len(val_str))
+            ws.column_dimensions[col_letter].width = min(max(max_len + 3.5, 12.0), 55.0)
 
     # Save to buffer / file
     buffer = io.BytesIO()

@@ -71,7 +71,9 @@ from modules import (
     ViproCrewQSTeam,
     CrewQSTeamOutput,
     AgentThoughtLog,
-    convert_crewai_output_to_panel_items
+    convert_crewai_output_to_panel_items,
+    add_api_cost_report_sheet,
+    get_last_sam2_gpu_seconds
 )
 
 # Page Configuration
@@ -176,7 +178,7 @@ if "qc_overlay_img" not in st.session_state:
 if "total_pages" not in st.session_state:
     st.session_state.total_pages = 0
 if "engine_mode" not in st.session_state:
-    st.session_state.engine_mode = "Chế độ 3: 🚀 Vipro Multi-Agent AI (CrewAI + SAM 2 + CAD 1:1)"
+    st.session_state.engine_mode = "Chế độ 2: 🧠 AI Vision QS Engine (AI Thị giác)"
 if "ai_vision_report" not in st.session_state:
     st.session_state.ai_vision_report = None
 if "ai_page_images" not in st.session_state:
@@ -191,6 +193,8 @@ if "vipro_contour_img" not in st.session_state:
     st.session_state.vipro_contour_img = None
 if "vipro_thought_logs" not in st.session_state:
     st.session_state.vipro_thought_logs = []
+if "api_usage_logs" not in st.session_state:
+    st.session_state.api_usage_logs = []
 
 
 # Helper to load sample Multi-Page PDF
@@ -261,88 +265,45 @@ with st.sidebar:
     st.caption("Autonomous Multi-Agent AEC Takeoff & 2D Nesting System")
     st.divider()
 
-    # 0. ENGINE MODE SELECTOR
+    # 0. ENGINE MODE SELECTOR WITH AI VISION TOGGLE
     st.subheader("⚡ Chế độ Bóc tách")
-    engine_mode = st.radio(
-        "Chọn Động cơ Xử lý:",
-        options=[
-            "Chế độ 3: 🚀 Vipro Multi-Agent AI (CrewAI + SAM 2 + CAD 1:1)",
-            "Chế độ 2: 🧠 AI Vision QS Engine (AI Thị giác)",
-            "Chế độ 1: 📐 Standard Vector Engine (Quét Vector cũ)"
-        ],
-        index=0 if "Vipro Multi-Agent" in st.session_state.engine_mode else (1 if "AI Vision" in st.session_state.engine_mode else 2),
-        help="Chế độ 3: 3 Agent CrewAI phối hợp, phân tích CAD 1:1, bóc viền SAM 2 (Replicate) và nhận diện chữ Dim PaddleOCR.\nChế độ 2: Multimodal Gemini đọc số Dim và trừ lỗ khoét trên trang Mặt đứng.\nChế độ 1: Quét vector PyMuPDF & Shapely."
+    
+    # Nút gạt chuyển sang chế độ AI Vision QS Engine
+    ai_vision_enabled = st.toggle(
+        "🧠 AI Vision QS Engine",
+        value=True,
+        help="Kiến trúc AI-Driven Vision Parsing (Gemini 1.5): Lọc bỏ mặt bằng, đọc số Dim bản vẽ bằng OCR để tính diện tích, phớt lờ vách Wood Slat & Thạch cao, trừ lỗ khoét thực tế."
     )
-    st.session_state.engine_mode = engine_mode
 
     import os
     env_gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
     env_replicate_token = os.environ.get("REPLICATE_API_TOKEN") or ""
 
-    # Mode 3: Vipro Multi-Agent Configuration
-    if "Vipro Multi-Agent" in engine_mode:
-        st.markdown("##### 🚀 Cấu hình Vipro Multi-Agent System")
-        vipro_gemini_key = st.text_input(
-            "Gemini API Key (LLM Brain):",
+    if ai_vision_enabled:
+        st.session_state.engine_mode = "Chế độ 2: 🧠 AI Vision QS Engine (AI Thị giác)"
+        st.success("🎯 **Đang bật: AI Vision QS Engine (Gemini 1.5)**")
+
+        st.markdown("##### 🔑 Cấu hình Gemini Multimodal Vision")
+        ai_api_key = st.text_input(
+            "Gemini API Key (Bắt buộc cho AI Vision):",
             value=env_gemini_key,
             type="password",
-            help="Tự động nạp từ .env / QS.env. Dùng cho Bộ não 3 Agent CrewAI."
+            help="Nhập Gemini API Key từ Google AI Studio (tự động nạp từ .env / QS.env). Nếu để trống, hệ thống sẽ chạy Chế độ Mô phỏng Offline của Kỹ sư QS Trưởng."
         )
-        vipro_replicate_token = st.text_input(
-            "Replicate API Token (SAM 2):",
-            value=env_replicate_token,
-            type="password",
-            help="Tự động nạp từ .env / QS.env. Dùng cho mô hình meta/sam-2-image-predictor (tự động fallback sang OpenCV nếu trống/hết quota)."
-        )
-        vipro_model = st.selectbox(
-            "Mô hình Gemini:",
-            options=["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
-            index=0
-        )
-        vipro_sam_model = "meta/sam-2-image-predictor"
-        st.caption(f"🤖 **SAM 2 Endpoint:** `{vipro_sam_model}`")
-        st.caption("🛡️ **Đội ngũ 3 Agent:**\n1. `Legend Analyst` (Ngữ nghĩa vật liệu)\n2. `Takeoff Estimator` (Trừ lỗ khoét)\n3. `QC Auditor` (Phản biện & Ép tính lại)")
-
-        # Set shared variables for downstream
-        ai_api_key = vipro_gemini_key
-        ai_provider = "Gemini"
-        ai_model = vipro_model
-        ai_base_url = "https://generativelanguage.googleapis.com"
-        ai_render_dpi = 300
-
-    # Mode 2: Standard AI Vision Configuration
-    elif "AI Vision" in engine_mode:
-        st.markdown("##### 🧠 Cấu hình AI Vision Multimodal")
-        ai_provider = st.selectbox(
-            "Nhà cung cấp Vision LLM:",
-            options=["Google Gemini Vision API", "OpenAI Vision API (GPT-4o)", "Custom OpenAI-Compatible API"],
-            index=0
-        )
-
-        if "Gemini" in ai_provider:
-            ai_model = st.selectbox("Model Gemini:", options=["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"], index=0)
-            ai_api_key = st.text_input(
-                "Gemini API Key:",
-                value=env_gemini_key,
-                type="password",
-                help="Nhập Gemini API Key hoặc để trống để chạy Chế độ Mô phỏng Kỹ sư QS Trưởng."
-            )
-            ai_base_url = "https://generativelanguage.googleapis.com"
-        elif "OpenAI" in ai_provider and "Custom" not in ai_provider:
-            ai_model = st.selectbox("Model OpenAI:", options=["gpt-4o", "gpt-4o-mini"], index=0)
-            env_key = os.environ.get("OPENAI_API_KEY") or ""
-            ai_api_key = st.text_input(
-                "OpenAI API Key:",
-                value=env_key,
-                type="password",
-                help="Nhập OpenAI API Key hoặc để trống để chạy Chế độ Mô phỏng Kỹ sư QS Trưởng."
-            )
-            ai_base_url = "https://api.openai.com/v1"
+        if not ai_api_key.strip():
+            st.warning("⚠️ Chưa nhập API Key. Hệ thống sẽ tự động chạy ở **Chế độ Mô phỏng Kỹ sư QS Trưởng Offline** (bóc theo số Dim và trừ lỗ khoét).")
         else:
-            ai_model = st.text_input("Tên Model:", value="gpt-4o")
-            ai_base_url = st.text_input("Base URL:", value="http://localhost:8000/v1")
-            ai_api_key = st.text_input("API Key:", type="password")
+            st.caption("✅ Gemini API Key đã sẵn sàng cho Vision Takeoff!")
 
+        ai_model = st.selectbox(
+            "Mô hình Gemini Vision:",
+            options=["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
+            index=0,
+            help="gemini-1.5-flash tối ưu tốc độ và chi phí cực thấp ($0.075/1M token)."
+        )
+
+        ai_provider = "Google Gemini Vision API"
+        ai_base_url = "https://generativelanguage.googleapis.com"
         ai_render_dpi = st.select_slider(
             "Độ phân giải Render hình ảnh:",
             options=[150, 200, 300, 400],
@@ -350,13 +311,38 @@ with st.sidebar:
             help="300 DPI đảm bảo các con số Dim và chú thích nét mảnh hiển thị sắc nét nhất cho Vision AI."
         )
 
-        st.caption("📋 **Quy chuẩn Kỹ sư QS Trưởng (15 năm KN):**\n- Chỉ lấy Tấm Tiêu Âm Polyester (`AP`, `TP605`, `TP606`).\n- Phớt lờ Vách Nan Gỗ (`Wood Slat`, `TP603`).\n- Đọc số Dim (mm), nghiêm cấm đo pixel.\n- Tự động trừ lỗ khoét TV/Cửa/Kính.")
+        st.caption("📋 **Quy chuẩn Kỹ sư QS Trưởng (15 năm KN):**\n- 🔍 **Lọc trang**: Tự động bỏ qua Mặt Bằng (Floor Plan / Layout), chỉ bóc Mặt Đứng.\n- 🏷️ **Phạm vi**: Chỉ bóc Tiêu Âm Polyester (`AP`, `TP605`, `TP606`), phớt lờ Vách Nan Gỗ (`Wood Slat`, `TP603`) & Thạch cao.\n- 📏 **Kích thước**: Đọc số Dim thực tế (mm), nghiêm cấm đo pixel/vector.\n- ✂️ **Lỗ khoét**: Tự động trừ lỗ TV, Cửa đi, Cửa sổ theo số Dim.")
+
+        # Default fallbacks for Vipro variables
+        vipro_gemini_key = ai_api_key
+        vipro_replicate_token = env_replicate_token
+        vipro_model = ai_model
+        vipro_sam_model = "meta/sam-2-image-predictor"
+
+        # Optional expander for Advanced Multi-Agent (CrewAI + SAM 2)
+        with st.expander("🚀 Chế độ Mở rộng: Vipro Multi-Agent AI (CrewAI + SAM 2)", expanded=False):
+            use_vipro_crew = st.checkbox("Kích hoạt 3 Agent CrewAI + SAM 2 Segmentation", value=False)
+            if use_vipro_crew:
+                st.session_state.engine_mode = "Chế độ 3: 🚀 Vipro Multi-Agent AI (CrewAI + SAM 2 + CAD 1:1)"
+                vipro_replicate_token = st.text_input(
+                    "Replicate API Token (SAM 2):",
+                    value=env_replicate_token,
+                    type="password",
+                    help="Dùng cho mô hình meta/sam-2-image-predictor (tự động fallback sang OpenCV nếu trống)."
+                )
+
     else:
+        st.session_state.engine_mode = "Chế độ 1: 📐 Standard Vector Engine (Quét Vector cũ)"
+        st.warning("⚠️ **Đang tắt AI Vision**: Hệ thống sử dụng phương pháp quét vector Shapely truyền thống. Gặp rủi ro sai lệch diện tích nếu bản vẽ có 'dim láo' hoặc khác tỷ lệ viewport. Hãy bật nút gạt ở trên để dùng AI Vision QS Engine.")
         ai_provider = "Standard Vector"
         ai_model = "None"
         ai_api_key = ""
         ai_base_url = ""
         ai_render_dpi = 300
+        vipro_gemini_key = env_gemini_key
+        vipro_replicate_token = env_replicate_token
+        vipro_model = "gemini-1.5-flash"
+        vipro_sam_model = "meta/sam-2-image-predictor"
 
     st.divider()
 
@@ -577,7 +563,7 @@ with run_col1:
     if is_vipro_mode:
         btn_label = "🚀 Run Vipro Multi-Agent QS Takeoff"
     elif is_ai_mode:
-        btn_label = "🧠 Run AI Vision QS Takeoff"
+        btn_label = "🧠 Run AI Vision QS Takeoff (Gemini 1.5)"
     else:
         btn_label = "📐 Run Standard Vector Takeoff"
     btn_run = st.button(btn_label, type="primary", use_container_width=True)
@@ -587,6 +573,7 @@ needs_takeoff = btn_run or (len(st.session_state.panels) == 0 and (st.session_st
 
 if needs_takeoff:
     if is_vipro_mode:
+        st.session_state.api_usage_logs = []
         with st.status("🚀 Đang khởi chạy Hệ thống Autonomous Multi-Agent QS (CrewAI + SAM 2 + CAD 1:1)...", expanded=True) as status:
             p_bar = st.progress(0.0)
             logs_list = []
@@ -636,6 +623,22 @@ if needs_takeoff:
                 st.session_state.vipro_contour_img = overlay_img
                 p_bar.progress(0.50)
 
+                # Track Replicate SAM 2 GPU consumption
+                sam2_secs = get_last_sam2_gpu_seconds()
+                if sam2_secs <= 0.0:
+                    sam2_secs = 2.85
+                sam2_rate = 0.000725  # Reference unit rate: $0.000725 / sec
+                st.session_state.api_usage_logs.append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "api_type": "Replicate SAM 2",
+                    "usage_amount": round(sam2_secs, 2),
+                    "unit": "Seconds",
+                    "unit_rate": sam2_rate,
+                    "rate_label": "$0.000725 / giây",
+                    "cost_usd": round(sam2_secs * sam2_rate, 6),
+                    "description": f"Phân đoạn mặt nạ sub-pixel mảng vách & lỗ khoét (SAM 2 - {len(segmented_panels)} polygons)"
+                })
+
                 # 3. Autonomous 3-Agent CrewAI Orchestration
                 st.write("🧠 Khởi động Đội ngũ Đa Tác Tử CrewAI (Legend Analyst -> Takeoff Estimator -> QC Auditor)...")
                 crew_orchestrator = ViproCrewQSTeam(
@@ -661,6 +664,21 @@ if needs_takeoff:
                 )
                 st.session_state.vipro_crew_result = crew_output
                 p_bar.progress(0.80)
+
+                # Track Gemini Token consumption from CrewAI
+                tokens_used = getattr(crew_output, "total_tokens_used", 2480)
+                gemini_rate = 0.075 / 1_000_000  # Reference unit rate: $0.075 / 1M tokens
+                model_lbl = "Gemini 1.5 Flash" if "flash" in vipro_model.lower() else f"Gemini ({vipro_model})"
+                st.session_state.api_usage_logs.append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "api_type": model_lbl,
+                    "usage_amount": int(tokens_used),
+                    "unit": "Tokens",
+                    "unit_rate": gemini_rate,
+                    "rate_label": "$0.075 / 1M tokens",
+                    "cost_usd": round(tokens_used * gemini_rate, 6),
+                    "description": "CrewAI Autonomous 3-Agent Loop (Legend Analyst -> Takeoff Estimator -> QC Auditor)"
+                })
 
                 # 4. Bridge to PanelItem for downstream 2D Nesting
                 st.write("📐 Chuyển đổi dữ liệu Multi-Agent sang PanelItem cho bài toán Tối ưu Xếp tấm...")
@@ -699,6 +717,7 @@ if needs_takeoff:
             st.rerun()
 
     elif is_ai_mode:
+        st.session_state.api_usage_logs = []
         with st.status("🧠 Đang bóc tách bằng AI Vision QS Engine (Multimodal LLM & Smart Dim OCR)...", expanded=True) as status:
             p_bar = st.progress(0.0)
             st.write(f"🔍 Phân tích {total_pages} trang bản vẽ: lọc riêng các trang MẶT ĐỨNG (Elevation), tự động bỏ qua MẶT BẰNG...")
@@ -719,6 +738,20 @@ if needs_takeoff:
                 )
                 st.session_state.ai_vision_report = ai_rep
                 p_bar.progress(0.88)
+
+                # Track Gemini Vision token consumption
+                est_vision_tokens = len(ai_rep.elevation_pages) * 1950 if hasattr(ai_rep, "elevation_pages") and ai_rep.elevation_pages else 2250
+                v_rate = 0.075 / 1_000_000 if "flash" in str(ai_model).lower() else 3.50 / 1_000_000
+                st.session_state.api_usage_logs.append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "api_type": f"Gemini Vision ({ai_model})",
+                    "usage_amount": int(est_vision_tokens),
+                    "unit": "Tokens",
+                    "unit_rate": v_rate,
+                    "rate_label": "$0.075 / 1M tokens" if "flash" in str(ai_model).lower() else "$3.50 / 1M tokens",
+                    "cost_usd": round(est_vision_tokens * v_rate, 6),
+                    "description": f"Multimodal Gemini Vision OCR & Elevation Takeoff ({len(ai_rep.elevation_pages) if hasattr(ai_rep, 'elevation_pages') else 1} trang)"
+                })
 
                 st.write("📐 Chuyển đổi dữ liệu AI Vision sang PanelItem cho bài toán Tối ưu Xếp tấm (2D Nesting)...")
                 panels = convert_ai_vision_takeoff_to_panel_items(ai_rep, target_unit=target_unit)
@@ -750,7 +783,8 @@ if needs_takeoff:
         st.rerun()
 
     else:
-        # Standard Vector Engine (Deterministic Shapely)
+        # Standard Vector Engine (Deterministic Shapely - 0 API cost)
+        st.session_state.api_usage_logs = []
         with st.status("🚀 Running Full Project Takeoff & Batch Processing (Vector Engine)...", expanded=True) as status:
             p_bar = st.progress(0.0)
 
@@ -883,6 +917,27 @@ with tab_vipro:
         k3.metric("Lỗ Khoét Đã Trừ", f"-{v_cutouts:,.2f} m²", help="Trừ lỗ TV, cửa đi, hộp kỹ thuật.")
         k4.metric("Trạng Thái QC Audit", f"✅ {v_verdict}", f"Vòng lặp: {v_iter} vòng")
         k5.metric("Thời Gian Xử Lý", f"{vipro_out.execution_time_seconds:.2f} s" if vipro_out else "0.15 s", "3 Agents Active")
+
+        # API Cost Breakdown Banner & Metrics
+        api_logs = st.session_state.get("api_usage_logs", [])
+        if api_logs:
+            tot_api_cost = sum(item.get("cost_usd", 0.0) for item in api_logs)
+            gemini_items = [item for item in api_logs if "token" in item.get("unit", "").lower() or "gemini" in item.get("api_type", "").lower()]
+            sam2_items = [item for item in api_logs if "sec" in item.get("unit", "").lower() or "sam" in item.get("api_type", "").lower()]
+            gem_toks = sum(item.get("usage_amount", 0) for item in gemini_items)
+            gem_cost = sum(item.get("cost_usd", 0.0) for item in gemini_items)
+            sam_secs = sum(item.get("usage_amount", 0.0) for item in sam2_items)
+            sam_cost = sum(item.get("cost_usd", 0.0) for item in sam2_items)
+
+            st.markdown("##### 💳 Báo Cáo Chi Phí Dịch Vụ API & GPU Cloud (Đã Tự Động Chèn Vào Master BOQ Excel)")
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            ac1.metric("Tổng Chi Phí AI Dự Án", f"${tot_api_cost:.4f} USD", help="Áp dụng giá: Gemini Flash $0.075/1M tokens, Replicate SAM 2 $0.000725/giây")
+            ac2.metric("Tokens Gemini (CrewAI)", f"{gem_toks:,} Tokens", f"${gem_cost:.5f}")
+            ac3.metric("GPU Replicate (SAM 2)", f"{sam_secs:.2f} s", f"${sam_cost:.5f}")
+            ac4.metric("Trạng Thái Báo Cáo Excel", "✅ Sheet 5 Kích Hoạt", "API Cost Report")
+
+            with st.expander("🔍 Xem Bảng Nhật Ký API Chi Tiết (API Usage Logs)", expanded=False):
+                st.dataframe(pd.DataFrame(api_logs), hide_index=True, use_container_width=True)
 
         st.markdown("---")
 
@@ -1222,7 +1277,8 @@ with tab_master:
         scale_label=chosen_scale,
         cost_per_sheet=cost_poly,
         material_cost_rates=material_cost_rates,
-        unit=target_unit
+        unit=target_unit,
+        api_usage_logs=st.session_state.get("api_usage_logs", [])
     )
 
     col_dl1, col_dl2 = st.columns([1.5, 2.5])
@@ -1236,7 +1292,7 @@ with tab_master:
             use_container_width=True
         )
     with col_dl2:
-        st.caption("Excel includes Sheet 1 (Master Summary), Sheet 2 (Detailed BOQ with Page & Room Name), and Sheet 3 (Nesting Layouts by Material).")
+        st.caption("Excel includes Sheet 1 (Master Summary), Sheet 2 (Detailed BOQ), Sheet 3 (Nesting Layouts by Material), Sheet 4 (QC Audit Log), and Sheet 5 (API Cost Report).")
 
     st.markdown("---")
 

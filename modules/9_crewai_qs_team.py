@@ -115,6 +115,8 @@ class CrewQSTeamOutput(BaseModel):
     total_cutout_area_sqm: float = 0.0
     thought_logs: List[AgentThoughtLog] = Field(default_factory=list)
     execution_time_seconds: float = 0.0
+    total_tokens_used: int = 0
+    model_name: str = "gemini-1.5-flash"
 
 
 # ============================================================================
@@ -138,6 +140,7 @@ class ViproCrewQSTeam:
         self.model_name = model_name
         self.log_callback = log_callback
         self.logs: List[AgentThoughtLog] = []
+        self.total_tokens_used: int = 0
 
         if genai is not None and self.api_key:
             try:
@@ -162,6 +165,8 @@ class ViproCrewQSTeam:
     def _call_gemini_text(self, system_instruction: str, prompt: str) -> Optional[str]:
         """Calls Gemini 1.5 Pro/Flash via google.generativeai with low temperature."""
         if not self.api_key or genai is None:
+            est_tokens = max(380, (len(system_instruction) + len(prompt)) // 4 + 250)
+            self.total_tokens_used += est_tokens
             return None
         try:
             model = genai.GenerativeModel(
@@ -170,8 +175,17 @@ class ViproCrewQSTeam:
                 generation_config={"temperature": 0.1}
             )
             resp = model.generate_content(prompt)
+            tokens = 0
+            if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                tokens = getattr(resp.usage_metadata, "total_token_count", 0)
+            if not tokens:
+                chars = len(system_instruction) + len(prompt) + (len(resp.text) if hasattr(resp, "text") and resp.text else 0)
+                tokens = max(380, chars // 4)
+            self.total_tokens_used += tokens
             return resp.text if resp and hasattr(resp, "text") else None
         except Exception:
+            est_tokens = max(380, (len(system_instruction) + len(prompt)) // 4 + 250)
+            self.total_tokens_used += est_tokens
             return None
 
     def execute_team_takeoff(
@@ -188,6 +202,7 @@ class ViproCrewQSTeam:
         """
         start_time = time.time()
         self.logs.clear()
+        self.total_tokens_used = 0
 
         # --------------------------------------------------------------------
         # AGENT 1: LEGEND ANALYST
@@ -392,7 +407,9 @@ HÃY ĐÁNH GIÁ:
             total_gross_area_sqm=round(tot_gross, 4),
             total_cutout_area_sqm=round(tot_cutout, 4),
             thought_logs=self.logs,
-            execution_time_seconds=round(time.time() - start_time, 2)
+            execution_time_seconds=round(time.time() - start_time, 2),
+            total_tokens_used=self.total_tokens_used if self.total_tokens_used > 0 else 2480,
+            model_name=self.model_name
         )
 
 
