@@ -6,19 +6,25 @@ Role: Senior Chief QS (15+ Years Commercial Experience) & AI/ML Vision Architect
 Solves Real-World CAD drafting defects ("dim láo", distorted viewport scales, open linework):
 1. Smart Page Skipping:
    - Scans text of each PDF page.
-   - Automatically SKIPS any page containing "MẶT BẰNG", "FLOOR PLAN", "LAYOUT".
-   - Strictly processes only pages containing "MẶT ĐỨNG", "ELEVATION", "CHI TIẾT".
+   - Accepts all drawing sheets (Floor Plans, Reflected Ceiling Plans, Elevations, Details) containing acoustic keywords:
+     "TIÊU ÂM", "ACOUSTIC", "AP", "PANEL", "TP", "TRẦN", "CEILING".
+   - Completely removes hard blocking of "MẶT BẰNG", "MAT BANG", "FLOOR PLAN".
 2. Multimodal Vision AI (Gemini 1.5):
-   - Renders valid elevation pages to crisp 300 DPI high-resolution images.
-   - Prompts Gemini 1.5: "Hãy đọc bảng Ghi chú (Legend), chỉ xác định các mảng Tiêu âm Polyester
-     (AP, TP603, TP605, TP606). Phớt lờ mọi vách Wood Slat và vách thạch cao. Định vị các mảng tiêu âm trên mặt đứng."
+   - Renders valid drawing pages to optimized 150 DPI images (max 200 DPI).
+   - Prompts Gemini 1.5 with Senior QS Instructions:
+     "BƯỚC 1: QUÉT BẢNG CHÚ THÍCH (LEGEND). Tìm tất cả các ký hiệu, hatch, màu sắc, chữ viết tắt (AP, TP, Acoustic Panel)
+      đại diện cho vật liệu tiêu âm (cả trần và vách). BƯỚC 2: QUÉT BẢN VẼ. Bất kỳ mảng nào có hatch/ký hiệu khớp với
+      Legend tiêu âm vừa tìm được đều phải bóc tách khối lượng."
 3. Dimension-Driven Calculation (Pure OCR & Dim Texts):
    - STRICTLY FORBIDS vector/Shapely area calculations to avoid viewport scale and "dim láo" errors.
-   - Forces Vision AI to read direct dimension texts (Width x Height in mm) around each wall section.
-   - Detects real cutouts (TV screens, door openings, windows/glazing) and reads their dim texts to deduct void area.
+   - Forces Vision AI to read direct dimension texts (Width x Height in mm) around each wall & ceiling section.
+   - Detects real cutouts (TV screens, door openings, windows/glazing, diffusers, lights) and reads their dim texts to deduct void area.
    - Enforces strict Pydantic JSON schema:
      {material_id, panel_width, panel_height, cutouts: [{width, height}], net_area_sqm}
-4. Seamlessly bridges to 2D Nesting Bin-Packing and Master BOQ Excel with API Cost Report.
+4. Robust Anti-Hang Execution:
+   - Enforces timeout=45s on Gemini API calls (genai.GenerativeModel.generate_content & REST).
+   - Bounded retry loop with max_retries=3 to prevent infinite loops.
+   - Seamlessly bridges to 2D Nesting Bin-Packing and Master BOQ Excel with API Cost Report.
 """
 
 from __future__ import annotations
@@ -38,6 +44,11 @@ import pandas as pd
 from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 import requests
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 try:
     import fitz  # PyMuPDF
@@ -73,43 +84,50 @@ def strip_accents_fast(s: str) -> str:
 
 def is_valid_elevation_page(page_text: str, sheet_title: str = "") -> Tuple[bool, str]:
     """
-    Nhiệm vụ 1: Smart Page Skipping (Lọc trang):
-    - Đọc Text của từng trang PDF. Tự động Skip (bỏ qua) tất cả các trang có chứa chữ "MẶT BẰNG", "FLOOR PLAN", "LAYOUT".
-    - Chỉ xử lý các trang có chữ "MẶT ĐỨNG", "ELEVATION", "CHI TIẾT".
+    Nhiệm vụ 1: Smart Page Skipping (Lọc trang thông minh):
+    - Xóa bỏ việc block cứng các từ khóa "MẶT BẰNG", "MAT BANG", "FLOOR PLAN".
+    - Đổi logic: Chấp nhận mọi trang bản vẽ (mặt bằng, mặt bằng trần, mặt đứng, chi tiết)
+      miễn là trong trang đó có chứa ít nhất một trong các từ khóa nhận diện tiêu âm:
+      "TIÊU ÂM", "ACOUSTIC", "AP", "PANEL", "TP", "TRẦN", "CEILING".
     """
     combined = f"{sheet_title}\n{page_text}"
     norm_text = strip_accents_fast(combined).upper()
+    raw_upper = combined.upper()
 
-    # 1. Negative Check: Tự động Skip trang MẶT BẰNG / FLOOR PLAN / LAYOUT
-    skip_keywords = ["MAT BANG", "FLOOR PLAN", "LAYOUT", "MB TUONG", "MB BO TRI", "MB NOI THAT"]
-    for kw in skip_keywords:
-        if kw in norm_text:
-            return False, f"Bỏ qua trang chứa từ khóa '{kw}' (Mặt Bằng / Layout)"
-
-    # 1b. Negative Check: Bỏ qua trang Bìa / Ghi chú chung / Thuyết minh không có chi tiết mặt đứng
+    # 1. Negative Check: Bỏ qua trang Bìa / Ghi chú chung / Thuyết minh không có bản vẽ chi tiết
     norm_title = strip_accents_fast(sheet_title).upper()
     cover_keywords = ["COVER SHEET", "GENERAL NOTES", "COVER SPECIFICATIONS", "THUYET MINH CHUNG", "BANG DANH MUC"]
     for kw in cover_keywords:
-        if kw in norm_title and not any(ek in norm_title for ek in ["MAT DUNG", "ELEVATION", "CHI TIET"]):
+        if kw in norm_title and not any(ek in norm_title for ek in ["CHI TIET", "MAT DUNG", "ELEVATION", "TRAN", "CEILING", "TIEU AM", "ACOUSTIC"]):
             return False, f"Bỏ qua trang Thuyết minh / Ghi chú chung ('{kw}')"
 
-    # 2. Positive Check: Chỉ xử lý MẶT ĐỨNG / ELEVATION / CHI TIẾT
-    valid_keywords = ["MAT DUNG", "ELEVATION", "CHI TIET"]
-    for kw in valid_keywords:
-        if kw in norm_text:
-            return True, f"Chấp thuận: Trang Mặt Đứng / Elevation / Chi Tiết hợp lệ ('{kw}')"
+    # 2. Positive Check (Ưu tiên hàng đầu): Nhận diện các từ khóa tiêu âm (cả trần và vách)
+    # Từ khóa nhận diện: "TIÊU ÂM", "ACOUSTIC", "AP", "PANEL", "TP", "TRẦN", "CEILING"
+    acoustic_checks = [
+        ("TIÊU ÂM", bool(re.search(r"TIEU\s*AM|TIÊU\s*ÂM", raw_upper) or "TIEU AM" in norm_text)),
+        ("ACOUSTIC", "ACOUSTIC" in norm_text),
+        ("AP", bool(re.search(r"\bAP(?:[-_\s\d]|\b)", norm_text))),
+        ("PANEL", "PANEL" in norm_text),
+        ("TP", bool(re.search(r"\bTP(?:[-_\s\d]|\b)", norm_text))),
+        ("TRẦN", bool("TRẦN" in raw_upper or re.search(r"\bTRAN\b", norm_text))),
+        ("CEILING", "CEILING" in norm_text),
+    ]
 
-    # 3. Mở rộng cho các từ khóa chuyên ngành tương đương Mặt Đứng Vách
+    for kw_name, matched in acoustic_checks:
+        if matched:
+            return True, f"Chấp thuận: Tìm thấy từ khóa nhận diện tiêu âm ('{kw_name}')"
+
+    # 3. Positive Check bổ sung: Các trang Mặt Đứng / Chi tiết kỹ thuật
     extended_valid = [
-        "WALL ELEVATION", "WALL FITOUT", "DETAIL", "SECTION",
-        "MAT CAT", "VACH TIEU AM", "ACOUSTIC WALL", "WALL DETAIL"
+        "MAT DUNG", "ELEVATION", "CHI TIET", "WALL ELEVATION",
+        "WALL FITOUT", "DETAIL", "SECTION", "MAT CAT", "VACH TIEU AM"
     ]
     for kw in extended_valid:
         if kw in norm_text:
-            return True, f"Chấp thuận: Tìm thấy từ khóa kỹ thuật Mặt Đứng ('{kw}')"
+            return True, f"Chấp thuận: Tìm thấy từ khóa kỹ thuật Mặt Đứng / Chi Tiết ('{kw}')"
 
-    # Mặc định: Không có dấu hiệu Mặt Đứng -> Bỏ qua
-    return False, "Bỏ qua: Không tìm thấy từ khóa MẶT ĐỨNG, ELEVATION, hoặc CHI TIẾT"
+    # Mặc định: Không có từ khóa tiêu âm hoặc mặt đứng -> Bỏ qua
+    return False, "Bỏ qua: Không tìm thấy từ khóa tiêu âm (TIÊU ÂM, ACOUSTIC, AP, PANEL, TP, TRẦN, CEILING) hoặc Mặt đứng/Chi tiết"
 
 
 def is_elevation_page_heuristic(sheet_name: str, page_text: str = "") -> Tuple[bool, str]:
@@ -269,24 +287,27 @@ class AIVisionProjectReport(BaseModel):
 
 
 # ============================================================================
-# 3. 300 DPI HIGH-RESOLUTION RENDERING & CAD OCR TOKENS
+# 3. 150 DPI HIGH-RESOLUTION RENDERING & CAD OCR TOKENS
 # ============================================================================
 
 def render_pdf_page_to_highres_image(
     page: Any,
-    dpi: int = 300,
+    dpi: int = 150,
     max_dimension: int = 4096
 ) -> Tuple[Image.Image, bytes, str]:
     """
-    Renders a PyMuPDF PDF page into a high-resolution PIL Image (300 DPI),
+    Renders a PyMuPDF PDF page into a high-resolution PIL Image (150 DPI, tối đa 200 DPI),
     encoded as JPEG bytes and base64 string for Multimodal Vision AI consumption.
-    300 DPI guarantees that tiny dimension numbers and thin leader lines are crystal clear.
+    150 DPI tối ưu hiệu suất, giảm tải dung lượng truyền qua API mạng và ngăn ngừa timeout/treo máy.
     """
     if fitz is None:
         raise ImportError("PyMuPDF (fitz) is required for PDF rendering.")
 
+    # Giới hạn an toàn: Mặc định 150 DPI, tối đa 200 DPI để tránh treo tiến trình API
+    effective_dpi = min(max(72, dpi), 200)
+
     # Standard PDF points are 72 DPI
-    zoom = dpi / 72.0
+    zoom = effective_dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
 
@@ -296,7 +317,7 @@ def render_pdf_page_to_highres_image(
         img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
 
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=90, optimize=True)
+    img.save(buffer, format="JPEG", quality=85, optimize=True)
     img_bytes = buffer.getvalue()
     b64_str = base64.b64encode(img_bytes).decode("utf-8")
 
@@ -307,7 +328,7 @@ def extract_cad_ocr_tokens(page: Any) -> Dict[str, Any]:
     """
     Scans the page using PyMuPDF word extraction to extract ground-truth anchor hints:
     - Candidate dimension numbers (2400, 1200, 1450, 830, 900, 2100 mm)
-    - Legend keywords (AP, TP605, TP603, TP606, Polyester, Wood Slat)
+    - Legend keywords (AP, TP605, TP603, TP606, Polyester, Wood Slat, Trần, Ceiling)
     Eliminates AI hallucinations by grounding Vision AI in true drawing texts.
     """
     tokens = {
@@ -334,12 +355,13 @@ def extract_cad_ocr_tokens(page: Any) -> Dict[str, Any]:
                 continue
         tokens["dimensions"] = sorted(list(set(cleaned_dims)), key=lambda x: int(x), reverse=True)
 
-        # Extract legend lines
+        # Extract legend lines (cả vách và trần tiêu âm)
         for line in text.split("\n"):
             line_str = line.strip()
             if any(k in line_str.upper() for k in [
                 "TP605", "TP603", "TP606", "AP-", "AP ", "POLYESTER",
-                "WOOD SLAT", "NAN GO", "TIEU AM", "ACOUSTIC", "DRYWALL", "THACH CAO"
+                "WOOD SLAT", "NAN GO", "TIEU AM", "ACOUSTIC", "DRYWALL", "THACH CAO",
+                "TRAN", "CEILING", "PANEL"
             ]):
                 tokens["legend_lines"].append(line_str)
 
@@ -365,22 +387,27 @@ NGUYÊN TẮC CỐT LÕI (BẮT BUỘC):
 "NGHIÊM CẤM TÍNH DIỆN TÍCH DỰA TRÊN TỌA ĐỘ HOẶC PIXEL VECTOR. BẮT BUỘC ĐỌC TRỰC TIẾP CON SỐ KÍCH THƯỚC (DIMENSION TEXTS) GHI TRÊN BẢN VẼ".
 
 CHỈ THỊ KỸ SƯ QS TRƯỞNG:
+"BƯỚC 1: QUÉT BẢNG CHÚ THÍCH (LEGEND). Tìm tất cả các ký hiệu, hatch, màu sắc, chữ viết tắt (AP, TP, Acoustic Panel) đại diện cho vật liệu tiêu âm (cả trần và vách). BƯỚC 2: QUÉT BẢN VẼ. Bất kỳ mảng nào có hatch/ký hiệu khớp với Legend tiêu âm vừa tìm được đều phải bóc tách khối lượng."
 "Hãy đọc bảng Ghi chú (Legend), chỉ xác định các mảng Tiêu âm Polyester (AP, TP603, TP605, TP606). Phớt lờ mọi vách Wood Slat và vách thạch cao. Định vị các mảng tiêu âm trên mặt đứng."
 
 QUY TRÌNH THỰC HIỆN 3 BƯỚC:
-1. ĐỌC BẢNG CHÚ THÍCH (LEGEND):
-   - Chỉ xác định và bóc tách các mảng TIÊU ÂM POLYESTER (ký hiệu: AP, AP-1, TP605, TP606, hoặc Polyester 9mm).
-   - PHỚT LỜ HOÀN TOÀN: Vách nan gỗ (Wood Slat, Gỗ đục lỗ), trần nan gỗ, vách thạch cao (Drywall), vách kính.
+1. BƯỚC 1: QUÉT BẢNG CHÚ THÍCH (LEGEND):
+   - Quét kỹ bảng Chú thích (Legend) trên bản vẽ.
+   - Tìm tất cả các ký hiệu, hatch, màu sắc, chữ viết tắt (AP, TP, Acoustic Panel) đại diện cho vật liệu tiêu âm (cả trần và vách).
+   - Chỉ xác định và bóc tách các mảng TIÊU ÂM (ký hiệu: AP, AP-1, TP605, TP606, Acoustic Panel, hoặc Polyester 9mm).
+   - PHỚT LỜ HOÀN TOÀN: Nan gỗ (Wood Slat, Gỗ đục lỗ), vách thạch cao (Drywall), trần thạch cao thường, vách kính thông thường.
    - Chú ý: Nếu trong bản vẽ ghi "TP603: Gỗ đục lỗ/Wood Slat" thì phải phớt lờ. Nếu ghi "TP603: Tấm tiêu âm Polyester" thì bóc tách.
 
-2. ĐỌC SỐ KÍCH THƯỚC (DIMENSION TEXT) TRÊN MẶT ĐỨNG:
-   - Đọc trực tiếp các con số kích thước (mm) trên đường gióng bao quanh mảng vách tiêu âm:
+2. BƯỚC 2: QUÉT BẢN VẼ & ĐỐI CHIẾU HATCH/KÝ HIỆU (CẢ TRẦN VÀ VÁCH):
+   - Bất kỳ mảng nào có hatch/ký hiệu khớp với Legend tiêu âm vừa tìm được đều phải bóc tách khối lượng.
+   - Áp dụng trên cả bản vẽ Mặt Đứng (vách tiêu âm) và Mặt Bằng Trần (trần tiêu âm).
+   - Đọc trực tiếp các con số kích thước (mm) trên đường gióng bao quanh mảng tiêu âm:
      + Chiều rộng: `panel_width` (mm)
-     + Chiều cao: `panel_height` (mm)
+     + Chiều cao/dài: `panel_height` (mm)
    - Lưu lại các số dim đọc được vào mảng `dim_annotations_found`.
 
-3. PHÁT HIỆN & TRỪ LỖ KHOÉT THỰC TẾ (CUTOUT DEDUCTIONS):
-   - Nhận diện các lỗ khoét: Màn hình TV họp, Cửa đi (Door), Cửa sổ/Vách kính (Window/Glazing), Hộp kỹ thuật âm tường.
+3. BƯỚC 3: PHÁT HIỆN & TRỪ LỖ KHOÉT THỰC TẾ (CUTOUT DEDUCTIONS):
+   - Nhận diện các lỗ khoét: Màn hình TV họp, Cửa đi (Door), Cửa sổ/Vách kính (Window/Glazing), Đèn âm, Miệng gió điều hòa (HVAC Diffuser/Grille), Hộp kỹ thuật âm tường/trần.
    - Đọc chính xác con số Dim (Rộng x Cao - mm) của từng lỗ khoét đó.
    - Tính diện tích từng lỗ khoét: `area_sqm = (width * height) / 1,000,000`.
    - Tính diện tích Net thanh toán:
@@ -391,10 +418,11 @@ QUY TRÌNH THỰC HIỆN 3 BƯỚC:
 CẤU TRÚC JSON ĐẦU RA BẮT BUỘC:
 Chỉ xuất DUY NHẤT một khối mã JSON hợp lệ (không kèm giải thích markdown ngoài khối JSON) tuân thủ cấu trúc sau:
 {
-  "sheet_title": "Tên bản vẽ mặt đứng",
+  "sheet_title": "Tên bản vẽ mặt đứng hoặc mặt bằng trần",
   "is_elevation": true,
   "legend_materials_found": {
     "TP605": "Tấm Tiêu Âm Sợi Polyester (BÓC TÁCH)",
+    "AP-01": "Tấm Trần Tiêu Âm Acoustic Panel (BÓC TÁCH)",
     "TP603": "Vách Nan Gỗ Wood Slat (PHỚT LỜ)",
     "DRYWALL": "Vách Thạch Cao (PHỚT LỜ)"
   },
@@ -432,6 +460,7 @@ def build_user_vision_prompt(sheet_title: str, ocr_tokens: Dict[str, Any]) -> st
 Tiêu đề trang: {sheet_title}
 
 CHỈ THỊ CỐT LÕI:
+"BƯỚC 1: QUÉT BẢNG CHÚ THÍCH (LEGEND). Tìm tất cả các ký hiệu, hatch, màu sắc, chữ viết tắt (AP, TP, Acoustic Panel) đại diện cho vật liệu tiêu âm (cả trần và vách). BƯỚC 2: QUÉT BẢN VẼ. Bất kỳ mảng nào có hatch/ký hiệu khớp với Legend tiêu âm vừa tìm được đều phải bóc tách khối lượng."
 "Hãy đọc bảng Ghi chú (Legend), chỉ xác định các mảng Tiêu âm Polyester (AP, TP603, TP605, TP606). Phớt lờ mọi vách Wood Slat và vách thạch cao. Định vị các mảng tiêu âm trên mặt đứng."
 
 DỮ LIỆU OCR ĐƯỢC QUÉT TRỰC TIẾP TỪ TEXT LAYER (DÙNG ĐỐI CHIẾU SỐ DIM):
@@ -440,17 +469,18 @@ DỮ LIỆU OCR ĐƯỢC QUÉT TRỰC TIẾP TỪ TEXT LAYER (DÙNG ĐỐI CHI�
 {legend_hints if legend_hints else "  (Không có text chú thích rõ - Hãy quan sát kỹ hình ảnh Legend trên bản vẽ)"}
 
 HÃY THỰC HIỆN:
-1. Đọc ảnh 300 DPI đính kèm, tìm Legend và xác định mảng Polyester (AP, TP605, TP606).
-2. Phớt lờ toàn bộ vách nan gỗ (Wood Slat) và vách thạch cao.
-3. Đọc trực tiếp các con số Dim ngang & dọc (mm) của mảng vách.
-4. Đọc số Dim các lỗ khoét TV, cửa, kính và trừ ra khỏi diện tích thô.
-5. Xuất kết quả theo định dạng JSON nghiêm ngặt {{"material_id", "panel_width", "panel_height", "cutouts": [{{"width", "height"}}], "net_area_sqm"}}.
+1. BƯỚC 1: QUÉT BẢNG CHÚ THÍCH (LEGEND). Tìm tất cả các ký hiệu, hatch, màu sắc, chữ viết tắt (AP, TP, Acoustic Panel) đại diện cho vật liệu tiêu âm (cả trần và vách).
+2. BƯỚC 2: QUÉT BẢN VẼ. Bất kỳ mảng nào có hatch/ký hiệu khớp với Legend tiêu âm vừa tìm được đều phải bóc tách khối lượng.
+3. Phớt lờ toàn bộ nan gỗ (Wood Slat) và vách thạch cao thông thường.
+4. Đọc trực tiếp các con số Dim ngang & dọc (mm) của mảng tiêu âm.
+5. Đọc số Dim các lỗ khoét TV, cửa, kính, đèn, miệng gió và trừ ra khỏi diện tích thô.
+6. Xuất kết quả theo định dạng JSON nghiêm ngặt {{"material_id", "panel_width", "panel_height", "cutouts": [{{"width", "height"}}], "net_area_sqm"}}.
 """
     return prompt
 
 
 # ============================================================================
-# 5. MULTIMODAL VISION AI (GEMINI 1.5) CLIENT
+# 5. MULTIMODAL VISION AI (GEMINI 1.5) CLIENT WITH ANTI-HANG & RETRY
 # ============================================================================
 
 def call_gemini_vision_api(
@@ -459,68 +489,101 @@ def call_gemini_vision_api(
     user_prompt: str,
     api_key: Optional[str] = None,
     model_name: str = "gemini-1.5-flash",
-    timeout: int = 90
+    timeout: int = 45,
+    max_retries: int = 3
 ) -> str:
     """
-    Calls Google Gemini Multimodal REST API (Gemini 1.5 Flash / Pro).
-    Default model is gemini-1.5-flash for rapid, accurate multimodal takeoff.
+    Calls Google Gemini Multimodal API with timeout=45s and max_retries=3.
+    Uses google.generativeai (genai.GenerativeModel.generate_content) with request_options={"timeout": 45},
+    with direct REST fallback. Prevents infinite loops and hanging processes.
     """
     key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
     if not key.strip():
         raise ValueError("Chưa cung cấp Gemini API Key. Vui lòng nhập API Key hoặc cấu hình trong file .env / QS.env.")
 
     clean_model = model_name.replace("models/", "")
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={key.strip()}"
+    retry_count = 0
+    last_error: Optional[Exception] = None
 
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "system_instruction": {
-            "parts": [
-                {"text": system_prompt}
-            ]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": user_prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image_b64
+    while retry_count < max_retries:
+        try:
+            # 1. Thử gọi qua google.generativeai SDK với timeout=45s (genai.GenerativeModel.generate_content)
+            if genai is not None:
+                try:
+                    genai.configure(api_key=key.strip())
+                    model = genai.GenerativeModel(
+                        model_name=clean_model,
+                        system_instruction=system_prompt,
+                        generation_config={
+                            "temperature": 0.1,
+                            "response_mime_type": "application/json"
                         }
-                    }
-                ]
+                    )
+                    img_data = base64.b64decode(image_b64)
+                    pil_img = Image.open(io.BytesIO(img_data))
+                    
+                    response = model.generate_content(
+                        [user_prompt, pil_img],
+                        request_options={"timeout": timeout}
+                    )
+                    if response and response.text:
+                        return response.text
+                except Exception as sdk_err:
+                    last_error = sdk_err
+
+            # 2. Fallback sang Direct REST API với timeout=45s
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={key.strip()}"
+            headers = {
+                "Content-Type": "application/json"
             }
-        ],
-        "generationConfig": {
-            "temperature": 0.1,  # Low temperature for strict factual numeric takeoff
-            "responseMimeType": "application/json"
-        }
-    }
+            payload = {
+                "system_instruction": {
+                    "parts": [
+                        {"text": system_prompt}
+                    ]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": user_prompt},
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": image_b64
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "responseMimeType": "application/json"
+                }
+            }
 
-    try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
-        if response.status_code != 200:
-            raise RuntimeError(f"Gemini API Error ({response.status_code}): {response.text}")
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                res_data = response.json()
+                candidates = res_data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts and "text" in parts[0]:
+                        return parts[0]["text"]
+                raise RuntimeError(f"Gemini returned invalid candidates: {res_data}")
+            else:
+                raise RuntimeError(f"Gemini API Error ({response.status_code}): {response.text[:300]}")
 
-        res_data = response.json()
-        candidates = res_data.get("candidates", [])
-        if not candidates:
-            raise RuntimeError(f"Gemini returned no candidates: {res_data}")
+        except requests.exceptions.Timeout:
+            last_error = TimeoutError(f"Gemini API request timed out sau {timeout}s (Lần thử {retry_count + 1}/{max_retries}).")
+        except Exception as e:
+            last_error = e
 
-        parts = candidates[0].get("content", {}).get("parts", [])
-        if not parts:
-            raise RuntimeError("Gemini candidate has no content parts.")
+        retry_count += 1
+        if retry_count < max_retries:
+            time.sleep(1.0 * retry_count)
 
-        return parts[0].get("text", "")
-    except requests.exceptions.Timeout:
-        raise TimeoutError(f"Gemini API request timed out after {timeout} seconds.")
-    except Exception as e:
-        raise RuntimeError(f"Gemini Vision API execution failed: {str(e)}")
+    raise RuntimeError(f"Gemini Vision API thất bại sau {max_retries} lần thử (timeout={timeout}s, max_retries={max_retries}). Lỗi: {str(last_error)}")
 
 
 def parse_and_validate_vision_json(
@@ -722,16 +785,16 @@ def process_document_with_ai_vision_qs(
     provider: str = "Google Gemini",
     model_name: str = "gemini-1.5-flash",
     base_url: str = "https://generativelanguage.googleapis.com",
-    render_dpi: int = 300,
+    render_dpi: int = 150,
     progress_callback: Optional[Any] = None
 ) -> AIVisionProjectReport:
     """
     Main entry point for AI Vision QS Takeoff:
     1. Loads PDF and inspects all pages.
-    2. Identifies ELEVATION (Mặt Đứng / Chi Tiết) sheets, skipping Floor Plans (Mặt Bằng / Layout).
-    3. Renders eligible pages at 300 DPI high resolution.
+    2. Identifies sheets with acoustic keywords (Floor Plans, Ceiling Plans, Elevations, Details).
+    3. Renders eligible pages at optimized 150 DPI (max 200 DPI).
     4. Extracts OCR text & dimension tokens.
-    5. Calls Gemini 1.5 Vision with Senior Chief QS Prompt.
+    5. Calls Gemini 1.5 Vision with Senior Chief QS Prompt (timeout=45s, max_retries=3).
     6. Validates output into strict Pydantic structures.
     7. Aggregates project-level metrics.
     """
@@ -761,7 +824,7 @@ def process_document_with_ai_vision_qs(
         if not sheet_name:
             for line in txt.split("\n"):
                 line_str = line.strip()
-                if any(k in line_str.upper() for k in ["LEVEL", "MẶT ĐỨNG", "MẶT BẰNG", "ELEVATION", "SECTION", "DETAIL", "COVER", "NOTES", "VACH"]):
+                if any(k in line_str.upper() for k in ["LEVEL", "MẶT ĐỨNG", "MẶT BẰNG", "ELEVATION", "SECTION", "DETAIL", "COVER", "NOTES", "VACH", "TRAN", "CEILING"]):
                     sheet_name = line_str[:60]
                     break
         if not sheet_name:
@@ -783,9 +846,9 @@ def process_document_with_ai_vision_qs(
             ))
             continue
 
-        # Render to 300 DPI High-Res Image
+        # Render to 150 DPI High-Res Image (Tối đa 200 DPI)
         if progress_callback:
-            progress_callback(p_idx, total_pages, f"Render hình ảnh 300 DPI Trang {p_num}...")
+            progress_callback(p_idx, total_pages, f"Render hình ảnh {render_dpi} DPI Trang {p_num}...")
 
         img, img_bytes, img_b64 = render_pdf_page_to_highres_image(page, dpi=render_dpi)
         ocr_tokens = extract_cad_ocr_tokens(page)
@@ -809,7 +872,8 @@ def process_document_with_ai_vision_qs(
                     user_prompt=user_prompt,
                     api_key=resolved_key,
                     model_name=model_name,
-                    timeout=120
+                    timeout=45,
+                    max_retries=3
                 )
                 page_res = parse_and_validate_vision_json(raw_resp, p_num, sheet_name)
                 processed_results.append(page_res)
